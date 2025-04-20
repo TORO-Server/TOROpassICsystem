@@ -1,5 +1,5 @@
 name: TOROpassICsystem
-version: 1.4
+version: 1.5
 main: prj.salmon.toropassicsystem.TOROpassICsystem
 api-version: 1.20
 commands:
@@ -12,6 +12,9 @@ commands:
   writecard:
     description: "ICカードに定期券情報を書き込みます"
     usage: "TOROpassの発売機で定期券データをコピーし、Minecraft内で貼り付けて実行してください"
+  toropassrank:
+    description: "TOROpassを使って移動した距離のランキングを表示します"
+    usage: "/toropassrank を打ち込むだけです"
 permissions:
   toropassicsystem.charge:
     description: "チャージコマンドの使用を許可します"
@@ -19,6 +22,11 @@ permissions:
   toropassicsystem.autocharge:
     description: "オートチャージ設定の使用を許可します"
     default: true
-  toropassicsytem.writecard:
+  toropassicsystem.writecard:
     description: "定期券情報の書き込みを許可します"
     default: true
+  toropassicsystem.toropassrank:
+    description: "TOROpass利用量ランキングの閲覧を許可します"
+    default: true
+
+

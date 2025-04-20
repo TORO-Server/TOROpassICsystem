@@ -4,7 +4,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import fi.iki.elonen.NanoHTTPD;
 import org.bukkit.*;
+import org.bukkit.block.Block;
 import org.bukkit.block.Sign;
+import org.bukkit.block.data.BlockData;
+import org.bukkit.block.data.Openable;
 import org.bukkit.block.sign.SignSide;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
@@ -30,6 +33,8 @@ import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExecutor {
     // 乗車中データ・残高
@@ -109,12 +114,11 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (command.getName().equalsIgnoreCase("charge")) {
-            if (!(sender instanceof Player)) {
+            if (!(sender instanceof Player player)) {
                 sender.sendMessage("このコマンドはプレイヤーのみ使用できます。");
                 return true;
             }
 
-            Player player = (Player) sender;
             if (args.length != 1) {
                 player.sendMessage(ChatColor.RED + "使用方法: /charge <金額>");
                 return true;
@@ -143,12 +147,11 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             return true;
         }
         if (command.getName().equalsIgnoreCase("autocharge")) {
-            if (!(sender instanceof Player)) {
+            if (!(sender instanceof Player player)) {
                 sender.sendMessage("このコマンドはプレイヤーのみ使用できます。");
                 return true;
             }
 
-            Player player = (Player) sender;
             if (args.length == 2) {
                 try {
                     int threshold = Integer.parseInt(args[0]);
@@ -195,12 +198,11 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             return true;
         }
         if (command.getName().equalsIgnoreCase("writecard")) {
-            if (!(sender instanceof Player)) {
+            if (!(sender instanceof Player player)) {
                 sender.sendMessage("このコマンドはプレイヤーのみ使用できます。");
                 return true;
             }
 
-            Player player = (Player) sender;
             if (args.length < 1 || args[0].trim().isEmpty()) {
                 player.sendMessage(ChatColor.RED + "使用方法: /writecard <券種>-<事業者コード>-<購入金額>-<有効期限>-<チェックデジット>");
                 return true;
@@ -292,15 +294,106 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             }
             return true;
         }
+        if (command.getName().equalsIgnoreCase("toropassrank")) {
+            if (!(sender instanceof Player player)) {
+                sender.sendMessage("このコマンドはプレイヤーのみ使用できます。");
+                return true;
+            }
+
+            Map<UUID, Integer> consumptionMap = new HashMap<>();
+            int totalConsumptionAllUsers = 0;
+            for (Map.Entry<UUID, StationData> entry : playerData.entrySet()) {
+                int totalConsumption = 0;
+                for (PaymentHistory history : entry.getValue().paymentHistory) {
+                    if (!history.from.startsWith("Special::") && !history.from.startsWith("Shop::")) {
+                        totalConsumption += Math.abs(history.amount);
+                    }
+                }
+                totalConsumptionAllUsers += totalConsumption;
+                if (totalConsumption > 0) {
+                    consumptionMap.put(entry.getKey(), totalConsumption);
+                }
+            }
+
+            List<Map.Entry<UUID, Integer>> sortedRanking = consumptionMap.entrySet().stream()
+                    .sorted(Map.Entry.<UUID, Integer>comparingByValue().reversed())
+                    .limit(10)
+                    .toList();
+
+            player.sendMessage(ChatColor.GOLD + "=====TOROpass 移動量ランキング=====");
+            int currentRank = 0;
+            int previousConsumption = -1;
+            int sameRankCount = 0;
+            boolean playerInTop10 = false;
+
+            for (Map.Entry<UUID, Integer> entry : sortedRanking) {
+                int consumption = entry.getValue();
+                if (consumption != previousConsumption) {
+                    currentRank += sameRankCount + 1;
+                    sameRankCount = 0;
+                } else {
+                    sameRankCount++;
+                }
+                previousConsumption = consumption;
+
+                String playerName = Bukkit.getOfflinePlayer(entry.getKey()).getName();
+                if (playerName == null) {
+                    playerName = "不明なプレイヤー";
+                }
+                double meters = consumption * 5.0;
+                String distance = meters >= 1000 ? String.format("%.3f", meters / 1000).replaceAll("0*$", "").replaceAll("\\.$", "") + "km" : String.format("%.0f", meters) + "m";
+                String message = ChatColor.YELLOW.toString() + currentRank + "位 " + playerName + " " + consumption + "トロポ " + distance;
+                if (entry.getKey().equals(player.getUniqueId())) {
+                    message += " (自分)";
+                    playerInTop10 = true;
+                }
+                player.sendMessage(message);
+            }
+
+            if (!playerInTop10) {
+                StationData playerDataEntry = playerData.computeIfAbsent(player.getUniqueId(), k -> new StationData());
+                int playerConsumption = 0;
+                for (PaymentHistory history : playerDataEntry.paymentHistory) {
+                    if (!history.from.startsWith("Special::") && !history.from.startsWith("Shop::")) {
+                        playerConsumption += Math.abs(history.amount);
+                    }
+                }
+
+                int playerRank = 1;
+                int playerSameRankCount = 0;
+                for (Map.Entry<UUID, Integer> entry : consumptionMap.entrySet().stream()
+                        .sorted(Map.Entry.<UUID, Integer>comparingByValue().reversed())
+                        .toList()) {
+                    if (entry.getKey().equals(player.getUniqueId())) {
+                        break;
+                    }
+                    if (entry.getValue() == playerConsumption) {
+                        playerSameRankCount++;
+                    } else {
+                        playerRank += playerSameRankCount + 1;
+                        playerSameRankCount = 0;
+                    }
+                }
+
+                double playerMeters = playerConsumption * 5.0;
+                String playerDistance = playerMeters >= 1000 ? String.format("%.3f", playerMeters / 1000).replaceAll("0*$", "").replaceAll("\\.$", "") + "km" : String.format("%.0f", playerMeters) + "m";
+                player.sendMessage(ChatColor.YELLOW.toString() + playerRank + "位 " + player.getName() + "(あなた) " + playerConsumption + "トロポ " + playerDistance);
+            }
+
+            double totalMeters = totalConsumptionAllUsers * 5.0;
+            String totalDistance = totalMeters >= 1000 ? String.format("%.3f", totalMeters / 1000).replaceAll("0*$", "").replaceAll("\\.$", "") + "km" : String.format("%.0f", totalMeters) + "m";
+            player.sendMessage(ChatColor.GOLD + "全ユーザーの移動量: " + totalConsumptionAllUsers + "トロポ " + totalDistance);
+
+            return true;
+        }
         return false;
     }
 
     @EventHandler
     public void onPlayerInteract(PlayerInteractEvent event) {
         if (event.getAction() != Action.RIGHT_CLICK_BLOCK) return;
-        if (!(event.getClickedBlock().getState() instanceof Sign)) return;
+        if (!(event.getClickedBlock().getState() instanceof Sign sign)) return;
 
-        Sign sign = (Sign) event.getClickedBlock().getState();
         Player player = event.getPlayer();
         ItemStack item = player.getInventory().getItemInMainHand();
 
@@ -317,7 +410,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             event.setCancelled(true);
 
             // [入場] と [出場] の処理
-            if ("[入場]".equals(frontLine1) || "[出場]".equals(frontLine1)) {
+            if ("[入場]".equals(frontLine1) || "[出場]".equals(frontLine1) || "[入出場]".equals(frontLine1)) {
                 StationData data = playerData.computeIfAbsent(player.getUniqueId(), k -> new StationData());
                 ItemMeta meta = item.getItemMeta();
                 Integer ticketType = meta.getPersistentDataContainer().get(ticketTypeKey, PersistentDataType.INTEGER);
@@ -335,6 +428,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                         return;
                     }
                     data.enterStation(frontLine2, frontLine4);
+                    openFenceGate(frontLine4,event);
                     player.sendMessage(ChatColor.GREEN + "入場: " + frontLine2);
                     player.sendMessage(ChatColor.GREEN + "残高: " + data.balance + "トロポ");
                     data.setRideStartLocation(player.getLocation());
@@ -345,6 +439,11 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                         return;
                     }
                     int fare = data.calculateFare();
+
+                    // 同じ駅で出場した場合は強制的に100トロポを引く
+                    if (data.stationName != null && data.stationName.equals(frontLine2)) {
+                        fare = 100;
+                    }
 
                     boolean isFree = false;
                     boolean isExpired = false;
@@ -401,6 +500,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     }
 
                     if (isFree) {
+                        openFenceGate(frontLine4,event);
                         player.sendMessage(ChatColor.GREEN + "出場: " + frontLine2);
                         player.sendMessage(ChatColor.GREEN + "残高: " + data.balance + "トロポ");
                         player.playSound(player.getLocation(), "custom.kaisatsu", 1.0F, 1.0F);
@@ -414,9 +514,14 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                             player.sendMessage(ChatColor.RED + String.valueOf(shortSF) + "トロポ不足しています。チャージしてください。");
                         } else {
                             data.balance -= fare;
-                            data.paymentHistory.add(PaymentHistory.build(data.stationName, frontLine2, fare * -1, data.balance, System.currentTimeMillis() / 1000L));
+                            openFenceGate(frontLine4,event);
+                            data.paymentHistory.add(PaymentHistory.build(data.stationName + data.entryCompanyCodes , frontLine2 + exitCompanyCodes, fare * -1, data.balance, System.currentTimeMillis() / 1000L));
                             save();
-                            player.sendMessage(ChatColor.GREEN + "出場: " + frontLine2 + " 引去: " + fare + "トロポ");
+                            if (data.stationName != null && data.stationName.equals(frontLine2)) {
+                                player.sendMessage(ChatColor.GREEN + "出場: " + frontLine2 + "(入場サービス) 引去: " + fare + "トロポ");
+                            }else{
+                                player.sendMessage(ChatColor.GREEN + "出場: " + frontLine2 + " 引去: " + fare + "トロポ");
+                            }
                             player.sendMessage(ChatColor.GREEN + "残高: " + data.balance + "トロポ");
                             if (isExpired && ticketType != null) {
                                 SimpleDateFormat sdf = new SimpleDateFormat("yyyy年MM月dd日");
@@ -426,10 +531,108 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                             data.exitStation();
                         }
                     }
+                }else{
+                    if (!data.isInStation) {
+                        data.enterStation(frontLine2, frontLine4);
+                        player.sendMessage(ChatColor.GREEN + "入場: " + frontLine2);
+                        player.sendMessage(ChatColor.GREEN + "残高: " + data.balance + "トロポ");
+                        data.setRideStartLocation(player.getLocation());
+                        player.playSound(player.getLocation(), "custom.kaisatsu", 1.0F, 1.0F);
+                    }else{
+                        int fare = data.calculateFare();
+
+                        if (data.stationName != null && data.stationName.equals(frontLine2)) {
+                            fare = 100;
+                        }
+
+                        boolean isFree = false;
+                        boolean isExpired = false;
+
+                        if (expiryDateLong != null) {
+                            Date expiryDate = new Date(expiryDateLong);
+                            Date now = new Date();
+                            isExpired = expiryDate.before(now);
+                            if (isExpired) {
+                                SimpleDateFormat sdf = new SimpleDateFormat("yyyy年MM月dd日 HH:mm:ss");
+                                player.sendMessage(ChatColor.RED + "定期券の有効期限 (" + sdf.format(new Date(expiryDateLong)) + ") が切れています。更新または消去処理をしてください。");
+                            }
+                        }
+
+                        if (ticketType != null && companyCode != null && !isExpired) {
+                            if (ticketType == 1) {
+                                if (companyCode == 99) {
+                                    isFree = true;
+                                    player.sendMessage(ChatColor.GREEN + "定期利用:TORO全線");
+                                } else if (data.entryCompanyCodes.contains(companyCodeStr) && exitCompanyCodes.contains(companyCodeStr)) {
+                                    isFree = true;
+                                    player.sendMessage(ChatColor.GREEN + "定期利用:全線定期");
+                                }
+                            } else if (ticketType == 4) {
+                                if (companyCode == 99) {
+                                    isFree = true;
+                                    player.sendMessage(ChatColor.GREEN + "定期利用:TORO全線");
+                                }else {
+                                    Date purchaseDate = new Date(expiryDateLong);
+                                    Date today = new Date();
+                                    SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd");
+                                    Calendar todayCalendar = Calendar.getInstance();
+                                    todayCalendar.setTime(today);
+                                    todayCalendar.set(Calendar.HOUR_OF_DAY, 23);
+                                    todayCalendar.set(Calendar.MINUTE, 59);
+                                    todayCalendar.set(Calendar.SECOND, 59);
+                                    todayCalendar.set(Calendar.MILLISECOND, 999);
+                                    Date todayEnd = todayCalendar.getTime();
+
+                                    if (data.entryCompanyCodes.contains(companyCodeStr) && exitCompanyCodes.contains(companyCodeStr) &&
+                                            sdf.format(purchaseDate).equals(sdf.format(today)) && !today.after(new Date(expiryDateLong))) {
+                                        isFree = true;
+                                        player.sendMessage(ChatColor.GREEN + "定期利用:1日乗車券");
+                                    }
+                                }
+                            } else if (ticketType == 2 || ticketType == 3) {
+                                if (data.entryCompanyCodes.contains(companyCodeStr) && exitCompanyCodes.contains(companyCodeStr) &&
+                                        (routeStart.equals(data.stationName) && routeEnd.equals(frontLine2) ||
+                                                routeStart.equals(frontLine2) && routeEnd.equals(data.stationName))) {
+                                    isFree = true;
+                                    player.sendMessage(ChatColor.GREEN + "定期利用:通勤･通学定期");
+                                }
+                            }
+                        }
+
+                        if (isFree) {
+                            player.sendMessage(ChatColor.GREEN + "出場: " + frontLine2);
+                            player.sendMessage(ChatColor.GREEN + "残高: " + data.balance + "トロポ");
+                            player.playSound(player.getLocation(), "custom.kaisatsu", 1.0F, 1.0F);
+                            data.exitStation();
+                        } else {
+                            if (data.checkAutoCharge()) {
+                                player.sendMessage(ChatColor.GREEN + "オートチャージが実行されました。新しい残高: " + data.balance + "トロポ");
+                            }
+                            if (data.balance < fare) {
+                                int shortSF = fare - data.balance;
+                                player.sendMessage(ChatColor.RED + String.valueOf(shortSF) + "トロポ不足しています。チャージしてください。");
+                            } else {
+                                data.balance -= fare;
+                                data.paymentHistory.add(PaymentHistory.build(data.stationName + data.entryCompanyCodes , frontLine2 + exitCompanyCodes, fare * -1, data.balance, System.currentTimeMillis() / 1000L));
+                                save();
+                                if (data.stationName != null && data.stationName.equals(frontLine2)) {
+                                    player.sendMessage(ChatColor.GREEN + "出場: " + frontLine2 + "(入場サービス) 引去: " + fare + "トロポ");
+                                }else{
+                                    player.sendMessage(ChatColor.GREEN + "出場: " + frontLine2 + " 引去: " + fare + "トロポ");
+                                }
+                                player.sendMessage(ChatColor.GREEN + "残高: " + data.balance + "トロポ");
+                                if (isExpired && ticketType != null) {
+                                    SimpleDateFormat sdf = new SimpleDateFormat("yyyy年MM月dd日");
+                                    player.sendMessage(ChatColor.RED + "定期券の有効期限 (" + sdf.format(new Date(expiryDateLong)) + ") が切れています。更新または消去処理をしてください。");
+                                }
+                                player.playSound(player.getLocation(), "custom.kaisatsu", 1.0F, 1.0F);
+                                data.exitStation();
+                            }
+                        }
+                    }
                 }
             }
 
-            // [チャージ] 看板
             if ("[チャージ]".equals(frontLine1)) {
                 try {
                     int chargeAmount = Integer.parseInt(frontLine2);
@@ -564,7 +767,6 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 List<String> exitCompanyCodes = data.validateCompanyCodes(frontLine4);
                 String companyCodeStr = companyCode != null ? String.format("%02d", companyCode) : null;
 
-                // 1. 出場処理（2行目の駅で精算）
                 int fare = data.calculateFare();
                 String previousStation = data.stationName;
 
@@ -620,6 +822,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
 
                 if (isFree) {
                     player.sendMessage(ChatColor.GREEN + "出場: " + frontLine2);
+                    openFenceGate(frontLine4,event);
                 } else {
                     if (data.checkAutoCharge()) {
                         player.sendMessage(ChatColor.GREEN + "オートチャージが実行されました。新しい残高: " + data.balance + "トロポ");
@@ -630,8 +833,9 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                         return;
                     } else {
                         data.balance -= fare;
-                        data.paymentHistory.add(PaymentHistory.build(data.stationName, frontLine2, fare * -1, data.balance, System.currentTimeMillis() / 1000L));
+                        data.paymentHistory.add(PaymentHistory.build(data.stationName + data.entryCompanyCodes , frontLine2 + exitCompanyCodes , fare * -1, data.balance, System.currentTimeMillis() / 1000L));
                         save();
+                        openFenceGate(frontLine4,event);
                         player.sendMessage(ChatColor.GREEN + "出場: " + frontLine2 + " 引去: " + fare + "トロポ");
                         if (isExpired && ticketType != null) {
                             SimpleDateFormat sdf = new SimpleDateFormat("yyyy年MM月dd日");
@@ -688,8 +892,71 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 } else {
                     player.sendMessage(ChatColor.RED + "この看板は物販用に正しく設定されていません。");
                 }
+            }
+        }
+        if ("[TOROpass販売]".equals(frontLine1)) {
+            if (player.isSneaking()) {
                 return;
             }
+            event.setCancelled(true);
+            try {
+                int customModelData = Integer.parseInt(frontLine2);
+                String[] costParts = frontLine3.split(" ");
+                if (costParts.length != 2) {
+                    player.sendMessage(ChatColor.RED + "看板の3行目が不正です（例: 3 diamond）");
+                    return;
+                }
+                int costAmount = Integer.parseInt(costParts[0]);
+                Material costMaterial = Material.matchMaterial(costParts[1].toLowerCase().replace("s$", ""));
+                if (costMaterial == null) {
+                    player.sendMessage(ChatColor.RED + "無効な素材名です: " + costParts[1]);
+                    return;
+                }
+                if (!player.getInventory().contains(costMaterial, costAmount)) {
+                    player.sendMessage(ChatColor.RED.toString() + costAmount + "個の" + costMaterial.name().toLowerCase() + "が不足しています。");
+                    return;
+                }
+                ItemStack costItem = new ItemStack(costMaterial, costAmount);
+                player.getInventory().removeItem(costItem);
+                ItemStack pass = new ItemStack(Material.PAPER, 1);
+                ItemMeta meta = pass.getItemMeta();
+                meta.setCustomModelData(customModelData);
+                String itemName;
+                switch (customModelData) {
+                    case 1:
+                        itemName = "TORO CARD";
+                        break;
+                    case 3:
+                        itemName = "Minu pass";
+                        break;
+                    case 4:
+                        itemName = "KOUDAN pass";
+                        break;
+                    case 5:
+                        itemName = "Rupica";
+                        break;
+                    case 6:
+                        itemName = "ShakechanRupica";
+                        break;
+                    case 7:
+                        itemName = "TOHOCA";
+                        break;
+                    case 2:
+                    default:
+                        itemName = "TOROpass";
+                        break;
+                }
+                meta.setDisplayName(ChatColor.RESET + itemName);
+                pass.setItemMeta(meta);
+                player.getInventory().addItem(pass);
+                player.sendMessage(ChatColor.GREEN + itemName + "を購入しました！");
+                player.playSound(player.getLocation(), Sound.ENTITY_VILLAGER_YES, 1.0F, 1.0F);
+            } catch (NumberFormatException e) {
+                player.sendMessage(ChatColor.RED + "看板の2行目または3行目の形式が不正です。");
+            } catch (Exception e) {
+                player.sendMessage(ChatColor.RED + "購入処理中にエラーが発生しました。");
+            }
+            return;
         }
     }
 
@@ -698,7 +965,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         String line1 = ChatColor.stripColor(event.getLine(0));
         Player player = event.getPlayer();
 
-        if ("[入場]".equals(line1) || "[出場]".equals(line1) || "[チャージ]".equals(line1) || "[定期券情報削除]".equals(line1)) {
+        if ("[入場]".equals(line1) || "[出場]".equals(line1) || "[チャージ]".equals(line1) || "[定期券情報削除]".equals(line1) || "[入出場]".equals(line1)) {
             String line2 = ChatColor.stripColor(event.getLine(1));
             if ("[定期券情報削除]".equals(line1)) {
                 player.sendMessage(ChatColor.GREEN + "定期券情報削除看板が正常に設定されました。");
@@ -774,8 +1041,6 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                         }
                         validCodes.add(String.format("%02d", codeNum));
                     } catch (NumberFormatException e) {
-                        player.sendMessage(ChatColor.RED + "4行目の事業者コードに正しくない値が含まれています: " + code);
-                        event.setCancelled(true);
                         return;
                     }
                 }
@@ -788,8 +1053,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
 
     @EventHandler
     public void onVehicleEnter(VehicleEnterEvent event) {
-        if (event.getEntered() instanceof Player) {
-            Player player = (Player) event.getEntered();
+        if (event.getEntered() instanceof Player player) {
             StationData data = playerData.computeIfAbsent(player.getUniqueId(), k -> new StationData());
             if (data.isInStation) {
                 data.setRideStartLocation(player.getLocation());
@@ -800,7 +1064,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     @EventHandler
     public void onVehicleMove(VehicleMoveEvent event) {
         if (event.getVehicle() instanceof Vehicle) {
-            Vehicle vehicle = (Vehicle) event.getVehicle();
+            Vehicle vehicle = event.getVehicle();
             if (vehicle.getPassengers().isEmpty()) return;
             Player player = (Player) vehicle.getPassengers().get(0);
             StationData data = playerData.computeIfAbsent(player.getUniqueId(), k -> new StationData());
@@ -814,11 +1078,9 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     private boolean isValidICCard(ItemStack item) {
         if (item == null || item.getType() != Material.PAPER) return false;
         ItemMeta meta = item.getItemMeta();
-        if (meta == null || !meta.hasCustomModelData()) return false;
-        return meta.getCustomModelData() == 1 || meta.getCustomModelData() == 2 || meta.getCustomModelData() == 3 ||
-                meta.getCustomModelData() == 4 || meta.getCustomModelData() == 5 || meta.getCustomModelData() == 6 ||
-                meta.getCustomModelData() == 7 || meta.getCustomModelData() == 8 || meta.getCustomModelData() == 9;
+        return meta != null && meta.hasCustomModelData();
     }
+
 
     public class StationData {
         public boolean isInStation = false;
@@ -886,6 +1148,47 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         }
     }
 
+    public void openFenceGate(String frontLine4, PlayerInteractEvent event) {
+        if (frontLine4 == null) return;
+
+        Matcher matcher = Pattern.compile("\\(\\s*-?\\d+\\s*,\\s*-?\\d+\\s*,\\s*-?\\d+\\s*,\\s*\\d+\\s*\\)").matcher(frontLine4);
+        if (matcher.find()) {
+            String match = matcher.group(); // 例: "(1,2,3,4)"
+            String[] parts = match.replaceAll("[()\\s]", "").split(",");
+            int offsetX = Integer.parseInt(parts[0]);
+            int offsetY = Integer.parseInt(parts[1]);
+            int offsetZ = Integer.parseInt(parts[2]);
+            int seconds = Integer.parseInt(parts[3]);
+
+            Location signLoc = event.getClickedBlock().getState().getLocation();
+            Location targetLoc = signLoc.clone().add(offsetX, offsetY, offsetZ);
+            Block targetBlock = targetLoc.getBlock();
+
+            if (targetBlock.getType().name().endsWith("_FENCE_GATE")) {
+                BlockData blockData = targetBlock.getBlockData();
+                if (blockData instanceof Openable gate && !gate.isOpen()) {
+                    gate.setOpen(true);
+                    targetBlock.setBlockData(gate);
+
+                    Bukkit.getScheduler().runTaskLater(this, () -> {
+                        Block b = targetLoc.getBlock();
+                        if (b.getType().name().endsWith("_FENCE_GATE")) {
+                            BlockData bd = b.getBlockData();
+                            if (bd instanceof Openable g) {
+                                g.setOpen(false);
+                                b.setBlockData(g);
+                            }
+                        }
+                    }, seconds * 20L);
+                }
+            }
+        }
+    }
+
+
+
+
+
     public static class HTTPServer extends NanoHTTPD {
         private final TOROpassICsystem mainclass;
 
@@ -899,30 +1202,63 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         public Response serve(IHTTPSession session) {
             String uri = session.getUri();
             ObjectMapper mapper = new ObjectMapper();
+
             if (uri.equals("/")) {
                 return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\"}");
+
             } else if (uri.startsWith("/api/balance/")) {
-                Player player = mainclass.getServer().getPlayer(session.getUri().substring("/api/balance/".length()));
-                if (Objects.isNull(player)) {
+                String playerName = uri.substring("/api/balance/".length());
+                OfflinePlayer player = Bukkit.getOfflinePlayer(playerName);
+                if (player == null || !mainclass.playerData.containsKey(player.getUniqueId())) {
                     return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found (Player Not Found)");
                 }
                 StationData data = mainclass.playerData.get(player.getUniqueId());
                 return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"balance\": " + data.balance + "}");
+
             } else if (uri.startsWith("/api/history/")) {
-                Player player = mainclass.getServer().getPlayer(session.getUri().substring("/api/history/".length()));
-                if (Objects.isNull(player)) {
+                String playerName = uri.substring("/api/history/".length());
+                OfflinePlayer player = Bukkit.getOfflinePlayer(playerName);
+                if (player == null || !mainclass.playerData.containsKey(player.getUniqueId())) {
                     return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found (Player Not Found)");
                 }
+
                 StationData data = mainclass.playerData.get(player.getUniqueId());
+                List<PaymentHistory> history = new ArrayList<>(data.paymentHistory);
+                Collections.reverse(history);
+
+                if (history.size() > 100) {
+                    history = history.subList(0, 100);
+                }
+
                 try {
-                    return newFixedLengthResponse(Response.Status.OK, "application/json", mapper.writeValueAsString(data.paymentHistory));
+                    return newFixedLengthResponse(Response.Status.OK, "application/json", mapper.writeValueAsString(history));
                 } catch (JsonProcessingException e) {
                     mainclass.getLogger().warning(e.getMessage());
-                    return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found (JSON Error)");
+                    return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "500 Internal Server Error (JSON Error)");
                 }
+
+            } else if (uri.startsWith("/api/fullhistory/")) {
+                String playerName = uri.substring("/api/fullhistory/".length());
+                OfflinePlayer player = Bukkit.getOfflinePlayer(playerName);
+                if (player == null || !mainclass.playerData.containsKey(player.getUniqueId())) {
+                    return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found (Player Not Found)");
+                }
+
+                StationData data = mainclass.playerData.get(player.getUniqueId());
+                List<PaymentHistory> fullHistory = new ArrayList<>(data.paymentHistory);
+                Collections.reverse(fullHistory);
+
+                try {
+                    return newFixedLengthResponse(Response.Status.OK, "application/json", mapper.writeValueAsString(fullHistory));
+                } catch (JsonProcessingException e) {
+                    mainclass.getLogger().warning(e.getMessage());
+                    return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "500 Internal Server Error (JSON Error)");
+                }
+
             } else {
                 return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found (URI Error)");
             }
         }
     }
+
 }
