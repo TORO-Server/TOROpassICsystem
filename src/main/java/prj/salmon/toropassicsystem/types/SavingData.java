@@ -9,6 +9,7 @@ public class SavingData {
     public ArrayList<PaymentHistory> paymentHistory;
     public Integer autoChargeAmount;
     public Integer autoChargeThreshold;
+    public String webChargePassword;
 
     public SavingData() {}
 }

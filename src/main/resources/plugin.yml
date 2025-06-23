@@ -1,5 +1,5 @@
 name: TOROpassICsystem
-version: 1.5
+version: 1.6
 main: prj.salmon.toropassicsystem.TOROpassICsystem
 api-version: 1.20
 commands:
@@ -15,6 +15,9 @@ commands:
   toropassrank:
     description: "TOROpassを使って移動した距離のランキングを表示します"
     usage: "/toropassrank を打ち込むだけです"
+  webcharge:
+    description: "Walletを使用するためのパスワードを設定します。コマンドを実行するたびにパスワードが変更されます。"
+    usage: "/webcharge を打ち込むだけです"
 permissions:
   toropassicsystem.charge:
     description: "チャージコマンドの使用を許可します"
@@ -27,6 +30,9 @@ permissions:
     default: true
   toropassicsystem.toropassrank:
     description: "TOROpass利用量ランキングの閲覧を許可します"
+    default: true
+  toropassicsystem.webcharge:
+    description: "Walletを使用するためのパスワード生成を許可します。パスワード生成後にこのPermissionを制限しても、Walletの利用は制限されません。"
     default: true
 
 

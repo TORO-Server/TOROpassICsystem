@@ -36,7 +36,6 @@ public class TOROpassICsystemAPI {
         }
     }
 
-    // 残高を取得するメソッド（必要に応じて）
     public int getBalance(Player player) {
         TOROpassICsystem.StationData data = plugin.playerData.get(player.getUniqueId());
         return data != null ? data.balance : 0;
