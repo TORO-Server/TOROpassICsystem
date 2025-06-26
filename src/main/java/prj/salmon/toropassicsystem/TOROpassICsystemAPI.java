@@ -16,28 +16,30 @@ public class TOROpassICsystemAPI {
         if (amount < 0) {
             return false; // 負の額の引き去りは無効
         }
-
-        // プレイヤーのデータを取得
-        TOROpassICsystem.StationData data = plugin.playerData.get(player.getUniqueId());
-        if (data == null) {
-            return false; // プレイヤーデータが存在しない場合
-        }
-
-        if (data.balance >= amount) {
-            // 残高を減らす
-            data.balance -= amount;
-            // 履歴を追加
-            data.paymentHistory.add(PaymentHistory.build("Other::deduct", "他のプラグインから引き去り", -amount, data.balance, System.currentTimeMillis() / 1000L));
-            plugin.save();
-            return true;
-        } else {
-            // 残高不足
+        try {
+            DatabaseManager.UserData user = plugin.dbManager.getUser(player.getUniqueId());
+            if (user == null) return false;
+            if (user.balance >= amount) {
+                user.balance -= amount;
+                user.lastupdate = System.currentTimeMillis() / 1000L;
+                plugin.dbManager.upsertUser(user);
+                PaymentHistory h = PaymentHistory.build("Other::deduct", "他のプラグインから引き去り", -amount, user.balance, System.currentTimeMillis() / 1000L, null);
+                plugin.dbManager.addHistory(user.uuid, h);
+                return true;
+            } else {
+                return false;
+            }
+        } catch (Exception e) {
             return false;
         }
     }
 
     public int getBalance(Player player) {
-        TOROpassICsystem.StationData data = plugin.playerData.get(player.getUniqueId());
-        return data != null ? data.balance : 0;
+        try {
+            DatabaseManager.UserData user = plugin.dbManager.getUser(player.getUniqueId());
+            return user != null ? user.balance : 0;
+        } catch (Exception e) {
+            return 0;
+        }
     }
 }
