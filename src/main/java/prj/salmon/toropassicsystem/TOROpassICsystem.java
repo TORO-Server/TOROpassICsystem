@@ -143,6 +143,10 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 }
             }
             if (command.getName().equalsIgnoreCase("charge")) {
+                if (!player.hasPermission("toropassicsystem.admin")) {
+                    player.sendMessage(ChatColor.RED + "チャージコマンドを実行する権限がありません。");
+                    return true;
+                }
                 if (args.length != 1) {
                     player.sendMessage(ChatColor.RED + "使用方法: /charge <金額>");
                     return true;
@@ -307,8 +311,19 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             String expiryDateStr = cardData[3];
             int checkDigit = Integer.parseInt(cardData[4]);
 
-            if (ticketType < 1 || ticketType > 4 || companyCode < 0 || companyCode > 99 || purchaseAmount < 0) {
+            if (ticketType < 1 || ticketType > 4 || companyCode < 0 || companyCode > 99 || purchaseAmount <= 0) {
                 player.sendMessage(ChatColor.RED + "コードの内容が正しくありません。コードを再度発行し直してください。");
+                return;
+            }
+
+            if (companyCode == 99 && !player.hasPermission("toropassicsystem.admin")) {
+                player.sendMessage(ChatColor.RED + "TORO全線定期を発行する権限がありません。");
+                return;
+            }
+
+            int expectedCheckDigit = computeCheckDigit(ticketType, companyCode, purchaseAmount, expiryDateStr);
+            if (checkDigit != expectedCheckDigit) {
+                player.sendMessage(ChatColor.RED + "チェックデジットが不正です。コードを再度発行し直してください。");
                 return;
             }
 
@@ -420,12 +435,20 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     player.sendMessage(ChatColor.GREEN + "現在の残高: " + user.balance + "トロポ");
                     break;
                 case "[強制出場]":
+                    if (!player.hasPermission("toropassicsystem.admin")) {
+                        player.sendMessage(ChatColor.RED + "強制出場を実行する権限がありません。");
+                        return;
+                    }
                     if (data.isInStation) {
                         player.sendMessage(ChatColor.GREEN + "強制出場しました。");
                         data.exitStation();
                     } else player.sendMessage(ChatColor.RED + "入場記録がありません。");
                     break;
                 case "[残額調整]":
+                    if (!player.hasPermission("toropassicsystem.admin")) {
+                        player.sendMessage(ChatColor.RED + "残額調整を実行する権限がありません。");
+                        return;
+                    }
                     handleBalanceAdjustment(frontLine2, player, data, user);
                     break;
                 case "[定期券情報削除]":
@@ -701,6 +724,10 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     private void handleShopSign(String storeName, String amountStr, Player player, StationData data, DatabaseManager.UserData user) {
         try {
             int amount = Integer.parseInt(amountStr);
+            if (amount <= 0) {
+                player.sendMessage(ChatColor.RED + "店舗看板の金額が不正です。管理者に連絡してください。");
+                return;
+            }
             
             // オートチャージチェック（DBの残高で判定）
             if (user.autoChargeThreshold != null && user.autoChargeAmount != null && user.balance < user.autoChargeThreshold) {
@@ -790,6 +817,11 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     public void onSignChange(SignChangeEvent event) {
         String line1 = ChatColor.stripColor(event.getLine(0));
         Player player = event.getPlayer();
+        if (isSpecialSignHeader(line1) && !player.hasPermission("toropassicsystem.admin")) {
+            player.sendMessage(ChatColor.RED + "特殊看板を設置する権限がありません。");
+            event.setCancelled(true);
+            return;
+        }
         switch (line1) {
             case "[入場]":
             case "[出場]":
@@ -894,6 +926,29 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         }
     }
 
+    public static int computeCheckDigit(int ticketType, int companyCode, int purchaseAmount, String expiryDate) {
+        String data = String.format("%d%02d%d%s", ticketType, companyCode, purchaseAmount, expiryDate);
+        int sum = 0;
+        for (int i = 0; i < data.length(); i++) {
+            char c = data.charAt(i);
+            if (Character.isDigit(c)) {
+                int digit = c - '0';
+                if (i % 2 == 1) digit *= 2;
+                sum += (digit / 10) + (digit % 10);
+            }
+        }
+        return (10 - (sum % 10)) % 10;
+    }
+
+    private static boolean isSpecialSignHeader(String header) {
+        if (header == null) return false;
+        return switch (header) {
+            case "[入場]", "[出場]", "[入出場]", "[チャージ]", "[残高確認]", "[強制出場]",
+                 "[残額調整]", "[定期券情報削除]", "[定期券情報照会]", "[乗換]", "[物販]", "[TOROpass販売]" -> true;
+            default -> false;
+        };
+    }
+
     private static boolean isValidICCard(ItemStack item) {
         return item != null && item.getType() == Material.PAPER && item.getItemMeta().hasCustomModelData();
     }
@@ -917,8 +972,14 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     private TicketValidationResult validateTicketFromDB(DatabaseManager.UserData user, StationData data, String exitStation, String companyCodesLine) {
         TicketValidationResult result = new TicketValidationResult();
         
-        if (user.ticketType == null || user.companyCode == null) {
+        if (user.ticketType == null || user.companyCode == null || user.checkDigit == null || user.purchaseAmount == null || user.expiryDate == null) {
             return result; // 定期券情報なし
+        }
+
+        SimpleDateFormat sdfDate = new SimpleDateFormat("yyyyMMdd");
+        String expStr = sdfDate.format(new Date(user.expiryDate));
+        if (user.checkDigit != computeCheckDigit(user.ticketType, user.companyCode, user.purchaseAmount, expStr)) {
+            return result; // チェックデジット不整合
         }
         
         result.ticketType = user.ticketType;
