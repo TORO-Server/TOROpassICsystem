@@ -5,4 +5,32 @@ iccard-names:
   5: "Rupica"
   6: "ShakechanRupica"
   7: "TOHOCA"
-  default: "TOROpass" 
+  default: "TOROpass"
+
+# Web API (Wallet) のセキュリティ設定
+# 既存の config.yml にこのセクションがない場合は、以下のデフォルト値が使われます
+api:
+  # true にすると /api/balance, /api/history, /api/fullhistory でもパスワードが必要になります
+  # パスワードは X-TOROpass-Password ヘッダー または ?password= クエリで渡します
+  # (現在の Wallet はパスワードを送信しないため、有効にする前に Wallet 側の対応が必要です)
+  require-auth-for-read: false
+  # クライアントIPを取得するヘッダー名 (リバースプロキシ経由の場合)
+  # 空文字にすると接続元アドレスを使用します
+  # ※ APIのポートに直接アクセスできる環境では、このヘッダーは偽装できます
+  client-ip-header: "CF-Connecting-IP"
+  # POSTリクエストのボディの最大サイズ (バイト)。超えた場合は 413 を返します
+  max-body-bytes: 16384
+  # メインスレッドでの処理 (/api/writecard など) を待つ最大時間 (ミリ秒)
+  sync-timeout-ms: 5000
+  # パスワード認証の失敗制限 (プレイヤー名ごと・クライアントIPごとに適用)
+  # window-seconds 秒以内に max-failures 回失敗すると、lockout-seconds 秒間 429 を返します
+  # 同じパスワードでの再試行は 1 回として数えます。認証に成功するとプレイヤー名側の回数はリセットされます
+  auth-throttle:
+    max-failures: 5
+    window-seconds: 600
+    lockout-seconds: 900
+  # 読み取り系API (/api/balance, /api/history, /api/fullhistory) のクライアントIPごとのリクエスト数制限
+  # window-seconds 秒あたり max-requests 回まで (0 で無制限)
+  read-rate-limit:
+    max-requests: 240
+    window-seconds: 60

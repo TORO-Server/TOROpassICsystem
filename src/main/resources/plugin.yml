@@ -19,9 +19,12 @@ commands:
     description: "Walletを使用するためのパスワードを設定します。コマンドを実行するたびにパスワードが変更されます。"
     usage: "/webcharge を打ち込むだけです"
 permissions:
+  toropassicsystem.admin:
+    description: "TOROpassの管理者権限 (特殊看板設置・残額調整など)"
+    default: op
   toropassicsystem.charge:
     description: "チャージコマンドの使用を許可します"
-    default: true
+    default: op
   toropassicsystem.autocharge:
     description: "オートチャージ設定の使用を許可します"
     default: true
@@ -34,5 +37,3 @@ permissions:
   toropassicsystem.webcharge:
     description: "Walletを使用するためのパスワード生成を許可します。パスワード生成後にこのPermissionを制限しても、Walletの利用は制限されません。"
     default: true
-
-

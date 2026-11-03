@@ -1,5 +1,6 @@
 package prj.salmon.toropassicsystem;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import fi.iki.elonen.NanoHTTPD;
 import org.bukkit.*;
@@ -12,6 +13,7 @@ import org.bukkit.block.sign.SignSide;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -24,6 +26,8 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
+import prj.salmon.toropassicsystem.api.ApiSecurity;
+import prj.salmon.toropassicsystem.api.RequestBodies;
 import prj.salmon.toropassicsystem.types.PaymentHistory;
 // import prj.salmon.toropassicsystem.types.SavingData;
 // import prj.salmon.toropassicsystem.types.SavingDataJson;
@@ -34,6 +38,12 @@ import java.sql.SQLException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.logging.Level;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -71,7 +81,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         getCommand("toropassrank").setExecutor(this);
         getCommand("webcharge").setExecutor(this);
         try {
-            httpserver = new HTTPServer(5744, this);
+            httpserver = new HTTPServer(5744, this, new ApiSecurity(loadApiSettings()));
         } catch (IOException e) {
             getLogger().warning(e.getMessage());
         }
@@ -85,6 +95,29 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             getLogger().warning("DBクローズ失敗: " + e.getMessage());
         }
         if (httpserver != null) httpserver.stop();
+    }
+
+    // config.yml の api セクションを読み込む (項目がない場合は安全なデフォルト値を使用)
+    private ApiSecurity.Settings loadApiSettings() {
+        ApiSecurity.Settings settings = new ApiSecurity.Settings();
+        ConfigurationSection api = getConfig().getConfigurationSection("api");
+        if (api == null) return settings;
+        settings.requireAuthForRead = api.getBoolean("require-auth-for-read", settings.requireAuthForRead);
+        settings.clientIpHeader = api.getString("client-ip-header", settings.clientIpHeader);
+        settings.maxBodyBytes = api.getInt("max-body-bytes", settings.maxBodyBytes);
+        settings.syncTimeoutMillis = api.getLong("sync-timeout-ms", settings.syncTimeoutMillis);
+        settings.authMaxFailures = api.getInt("auth-throttle.max-failures", settings.authMaxFailures);
+        settings.authWindowSeconds = api.getLong("auth-throttle.window-seconds", settings.authWindowSeconds);
+        settings.authLockoutSeconds = api.getLong("auth-throttle.lockout-seconds", settings.authLockoutSeconds);
+        settings.readMaxRequests = api.getInt("read-rate-limit.max-requests", settings.readMaxRequests);
+        settings.readWindowSeconds = api.getLong("read-rate-limit.window-seconds", settings.readWindowSeconds);
+        return settings;
+    }
+
+    // 内部エラーの詳細はサーバーログにのみ出力し、プレイヤーには一般的なメッセージを表示する
+    private void sendInternalError(CommandSender target, String context, Exception e) {
+        getLogger().log(Level.WARNING, context + " (" + target.getName() + ")", e);
+        target.sendMessage(ChatColor.RED + context + "が発生しました。時間をおいて再度お試しください。");
     }
 
     @Override
@@ -110,11 +143,21 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 }
             }
             if (command.getName().equalsIgnoreCase("charge")) {
+                if (!player.hasPermission("toropassicsystem.admin")) {
+                    player.sendMessage(ChatColor.RED + "チャージコマンドを実行する権限がありません。");
+                    return true;
+                }
                 if (args.length != 1) {
                     player.sendMessage(ChatColor.RED + "使用方法: /charge <金額>");
                     return true;
                 }
-                int amount = Integer.parseInt(args[0]);
+                int amount;
+                try {
+                    amount = Integer.parseInt(args[0]);
+                } catch (NumberFormatException e) {
+                    player.sendMessage(ChatColor.RED + "チャージ額が不正です");
+                    return true;
+                }
                 if (amount <= 0 || user.balance + amount > 20000) {
                     player.sendMessage(ChatColor.RED + (amount <= 0 ? "チャージ額が不正です" : "最大チャージ額は20000トロポまでです"));
                     return true;
@@ -179,7 +222,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                         if (totalConsumption > 0) consumptionMap.put(u.uuid, totalConsumption);
                     }
                 } catch (Exception e) {
-                    player.sendMessage(ChatColor.RED + "ランキング取得エラー: " + e.getMessage());
+                    sendInternalError(player, "ランキング取得エラー", e);
                     return true;
                 }
 
@@ -219,7 +262,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                             .mapToInt(h -> Math.abs(h.amount))
                             .sum();
                     } catch (Exception e) {
-                        player.sendMessage(ChatColor.RED + "ランキング取得エラー: " + e.getMessage());
+                        sendInternalError(player, "ランキング取得エラー", e);
                     }
                     int playerRank = 1, playerSameRankCount = 0;
                     for (Map.Entry<UUID, Integer> entry : consumptionMap.entrySet().stream()
@@ -250,26 +293,37 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 return true;
             }
         } catch (Exception e) {
-            sender.sendMessage(ChatColor.RED + "エラー: " + e.getMessage());
+            sendInternalError(sender, "エラー", e);
         }
         return false;
     }
 
     private void writeCard(Player player, DatabaseManager.UserData user, String cardDataStr, String historyFrom) {
         String[] cardData = cardDataStr.split("-");
-        if (cardData.length < 5 || (cardData.length != 7 && (Integer.parseInt(cardData[0]) == 2 || Integer.parseInt(cardData[0]) == 3))) {
-            player.sendMessage(ChatColor.RED + "入力内容が正しくありません。コードを再度発行し直してください。");
-            return;
-        }
         try {
+            if (cardData.length < 5 || (cardData.length != 7 && (Integer.parseInt(cardData[0]) == 2 || Integer.parseInt(cardData[0]) == 3))) {
+                player.sendMessage(ChatColor.RED + "入力内容が正しくありません。コードを再度発行し直してください。");
+                return;
+            }
             int ticketType = Integer.parseInt(cardData[0]);
             int companyCode = Integer.parseInt(cardData[1]);
             int purchaseAmount = Integer.parseInt(cardData[2]);
             String expiryDateStr = cardData[3];
             int checkDigit = Integer.parseInt(cardData[4]);
 
-            if (ticketType < 1 || ticketType > 4 || companyCode < 0 || companyCode > 99 || purchaseAmount < 0) {
+            if (ticketType < 1 || ticketType > 4 || companyCode < 0 || companyCode > 99 || purchaseAmount <= 0) {
                 player.sendMessage(ChatColor.RED + "コードの内容が正しくありません。コードを再度発行し直してください。");
+                return;
+            }
+
+            if (companyCode == 99 && !player.hasPermission("toropassicsystem.admin")) {
+                player.sendMessage(ChatColor.RED + "TORO全線定期を発行する権限がありません。");
+                return;
+            }
+
+            int expectedCheckDigit = computeCheckDigit(ticketType, companyCode, purchaseAmount, expiryDateStr);
+            if (checkDigit != expectedCheckDigit) {
+                player.sendMessage(ChatColor.RED + "チェックデジットが不正です。コードを再度発行し直してください。");
                 return;
             }
 
@@ -308,7 +362,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 dbManager.addHistory(user.uuid, h);
                 dbManager.upsertUser(user);
             } catch (SQLException ex) {
-                player.sendMessage(ChatColor.RED + "DBエラー: " + ex.getMessage());
+                sendInternalError(player, "DBエラー", ex);
                 return;
             }
             player.sendMessage(ChatColor.GREEN + "定期券情報を書き込みました。");
@@ -381,12 +435,20 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     player.sendMessage(ChatColor.GREEN + "現在の残高: " + user.balance + "トロポ");
                     break;
                 case "[強制出場]":
+                    if (!player.hasPermission("toropassicsystem.admin")) {
+                        player.sendMessage(ChatColor.RED + "強制出場を実行する権限がありません。");
+                        return;
+                    }
                     if (data.isInStation) {
                         player.sendMessage(ChatColor.GREEN + "強制出場しました。");
                         data.exitStation();
                     } else player.sendMessage(ChatColor.RED + "入場記録がありません。");
                     break;
                 case "[残額調整]":
+                    if (!player.hasPermission("toropassicsystem.admin")) {
+                        player.sendMessage(ChatColor.RED + "残額調整を実行する権限がありません。");
+                        return;
+                    }
                     handleBalanceAdjustment(frontLine2, player, data, user);
                     break;
                 case "[定期券情報削除]":
@@ -405,7 +467,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     break;
             }
         } catch (Exception e) {
-            player.sendMessage(ChatColor.RED + "エラー: " + e.getMessage());
+            sendInternalError(player, "エラー", e);
         }
     }
 
@@ -447,7 +509,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             try {
                 dbManager.addHistory(user.uuid, h);
             } catch (SQLException e) {
-                player.sendMessage(ChatColor.RED + "履歴保存エラー: " + e.getMessage());
+                sendInternalError(player, "履歴保存エラー", e);
             }
         } else {
             // オートチャージチェック（DBの残高で判定）
@@ -460,7 +522,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     PaymentHistory autoChargeHistory = PaymentHistory.build("Special::autocharge", "", user.autoChargeAmount, user.balance, System.currentTimeMillis() / 1000L, "オートチャージ");
                     dbManager.addHistory(user.uuid, autoChargeHistory);
                 } catch (SQLException e) {
-                    player.sendMessage(ChatColor.RED + "オートチャージエラー: " + e.getMessage());
+                    sendInternalError(player, "オートチャージエラー", e);
                     return;
                 }
                 player.sendMessage(ChatColor.GREEN + "オートチャージが実行されました。新しい残高: " + user.balance + "トロポ");
@@ -480,7 +542,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 dbManager.addHistory(user.uuid, h);
                 dbManager.upsertUser(user);
             } catch (SQLException e) {
-                player.sendMessage(ChatColor.RED + "DBエラー: " + e.getMessage());
+                sendInternalError(player, "DBエラー", e);
                 return;
             }
             
@@ -509,7 +571,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 dbManager.addHistory(user.uuid, h);
                 dbManager.upsertUser(user);
             } catch (SQLException e) {
-                player.sendMessage(ChatColor.RED + "DBエラー: " + e.getMessage());
+                sendInternalError(player, "DBエラー", e);
                 return;
             }
             
@@ -536,7 +598,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 dbManager.addHistory(user.uuid, h);
                 dbManager.upsertUser(user);
             } catch (SQLException e) {
-                player.sendMessage(ChatColor.RED + "DBエラー: " + e.getMessage());
+                sendInternalError(player, "DBエラー", e);
                 return;
             }
             
@@ -566,7 +628,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             dbManager.upsertUser(user);
             player.sendMessage(ChatColor.GREEN + "定期券情報を削除しました。");
         } catch (SQLException e) {
-            player.sendMessage(ChatColor.RED + "DBエラー: " + e.getMessage());
+            sendInternalError(player, "DBエラー", e);
         }
     }
 
@@ -610,7 +672,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             try {
                 dbManager.addHistory(user.uuid, h);
             } catch (SQLException e) {
-                player.sendMessage(ChatColor.RED + "履歴保存エラー: " + e.getMessage());
+                sendInternalError(player, "履歴保存エラー", e);
             }
         } else {
             // オートチャージチェック（DBの残高で判定）
@@ -623,7 +685,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     PaymentHistory autoChargeHistory = PaymentHistory.build("Special::autocharge", "", user.autoChargeAmount, user.balance, System.currentTimeMillis() / 1000L, "オートチャージ");
                     dbManager.addHistory(user.uuid, autoChargeHistory);
                 } catch (SQLException e) {
-                    player.sendMessage(ChatColor.RED + "オートチャージエラー: " + e.getMessage());
+                    sendInternalError(player, "オートチャージエラー", e);
                     return;
                 }
                 player.sendMessage(ChatColor.GREEN + "オートチャージが実行されました。新しい残高: " + user.balance + "トロポ");
@@ -643,7 +705,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 dbManager.addHistory(user.uuid, h);
                 dbManager.upsertUser(user);
             } catch (SQLException e) {
-                player.sendMessage(ChatColor.RED + "DBエラー: " + e.getMessage());
+                sendInternalError(player, "DBエラー", e);
                 return;
             }
             
@@ -662,6 +724,10 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     private void handleShopSign(String storeName, String amountStr, Player player, StationData data, DatabaseManager.UserData user) {
         try {
             int amount = Integer.parseInt(amountStr);
+            if (amount <= 0) {
+                player.sendMessage(ChatColor.RED + "店舗看板の金額が不正です。管理者に連絡してください。");
+                return;
+            }
             
             // オートチャージチェック（DBの残高で判定）
             if (user.autoChargeThreshold != null && user.autoChargeAmount != null && user.balance < user.autoChargeThreshold) {
@@ -673,7 +739,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     PaymentHistory autoChargeHistory = PaymentHistory.build("Special::autocharge", "", user.autoChargeAmount, user.balance, System.currentTimeMillis() / 1000L, "オートチャージ");
                     dbManager.addHistory(user.uuid, autoChargeHistory);
                 } catch (SQLException e) {
-                    player.sendMessage(ChatColor.RED + "オートチャージエラー: " + e.getMessage());
+                    sendInternalError(player, "オートチャージエラー", e);
                     return;
                 }
                 player.sendMessage(ChatColor.GREEN + "オートチャージが実行されました。新しい残高: " + user.balance + "トロポ");
@@ -693,7 +759,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 dbManager.addHistory(user.uuid, h);
                 dbManager.upsertUser(user);
             } catch (SQLException e) {
-                player.sendMessage(ChatColor.RED + "DBエラー: " + e.getMessage());
+                sendInternalError(player, "DBエラー", e);
                 return;
             }
             
@@ -751,6 +817,11 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     public void onSignChange(SignChangeEvent event) {
         String line1 = ChatColor.stripColor(event.getLine(0));
         Player player = event.getPlayer();
+        if (isSpecialSignHeader(line1) && !player.hasPermission("toropassicsystem.admin")) {
+            player.sendMessage(ChatColor.RED + "特殊看板を設置する権限がありません。");
+            event.setCancelled(true);
+            return;
+        }
         switch (line1) {
             case "[入場]":
             case "[出場]":
@@ -855,6 +926,29 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         }
     }
 
+    public static int computeCheckDigit(int ticketType, int companyCode, int purchaseAmount, String expiryDate) {
+        String data = String.format("%d%02d%d%s", ticketType, companyCode, purchaseAmount, expiryDate);
+        int sum = 0;
+        for (int i = 0; i < data.length(); i++) {
+            char c = data.charAt(i);
+            if (Character.isDigit(c)) {
+                int digit = c - '0';
+                if (i % 2 == 1) digit *= 2;
+                sum += (digit / 10) + (digit % 10);
+            }
+        }
+        return (10 - (sum % 10)) % 10;
+    }
+
+    private static boolean isSpecialSignHeader(String header) {
+        if (header == null) return false;
+        return switch (header) {
+            case "[入場]", "[出場]", "[入出場]", "[チャージ]", "[残高確認]", "[強制出場]",
+                 "[残額調整]", "[定期券情報削除]", "[定期券情報照会]", "[乗換]", "[物販]", "[TOROpass販売]" -> true;
+            default -> false;
+        };
+    }
+
     private static boolean isValidICCard(ItemStack item) {
         return item != null && item.getType() == Material.PAPER && item.getItemMeta().hasCustomModelData();
     }
@@ -878,8 +972,14 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     private TicketValidationResult validateTicketFromDB(DatabaseManager.UserData user, StationData data, String exitStation, String companyCodesLine) {
         TicketValidationResult result = new TicketValidationResult();
         
-        if (user.ticketType == null || user.companyCode == null) {
+        if (user.ticketType == null || user.companyCode == null || user.checkDigit == null || user.purchaseAmount == null || user.expiryDate == null) {
             return result; // 定期券情報なし
+        }
+
+        SimpleDateFormat sdfDate = new SimpleDateFormat("yyyyMMdd");
+        String expStr = sdfDate.format(new Date(user.expiryDate));
+        if (user.checkDigit != computeCheckDigit(user.ticketType, user.companyCode, user.purchaseAmount, expStr)) {
+            return result; // チェックデジット不整合
         }
         
         result.ticketType = user.ticketType;
@@ -1047,12 +1147,16 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     }
 
     public static class HTTPServer extends NanoHTTPD {
-        private final TOROpassICsystem mainclass;
+        private static final Set<String> POST_ROUTES = Set.of("/api/webcharge", "/api/writecard", "/api/getcardinfo", "/api/delcardinfo", "/api/pay");
 
-        public HTTPServer(int port, TOROpassICsystem mainclass) throws IOException {
+        private final TOROpassICsystem mainclass;
+        private final ApiSecurity security;
+
+        public HTTPServer(int port, TOROpassICsystem mainclass, ApiSecurity security) throws IOException {
             super(port);
-            start(SOCKET_READ_TIMEOUT, false);
             this.mainclass = mainclass;
+            this.security = security;
+            start(SOCKET_READ_TIMEOUT, false);
         }
 
         @Override
@@ -1060,6 +1164,29 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             try {
                 String uri = session.getUri();
                 Method method = session.getMethod();
+                String clientIp = security.clientIp(session.getHeaders(), session.getRemoteIpAddress());
+
+                // 読み取り系API: IPごとのレート制限と、設定で有効な場合はパスワード認証
+                if (uri.startsWith("/api/balance/") || uri.startsWith("/api/history/") || uri.startsWith("/api/fullhistory/")) {
+                    Response denied = guardReadRoute(session, uri, clientIp);
+                    if (denied != null) return denied;
+                }
+
+                // POST API: ボディをサイズ上限付きで読み込み、JSONとして解析する
+                Map<String, Object> request = null;
+                if (method == Method.POST && POST_ROUTES.contains(uri)) {
+                    try {
+                        request = readJsonBody(session);
+                    } catch (RequestBodies.BodyException e) {
+                        Response r = jsonError(e.getStatus() == 413 ? Response.Status.PAYLOAD_TOO_LARGE : Response.Status.BAD_REQUEST, e.getMessage());
+                        // 読み残したボディが次のリクエストとして解釈されないよう接続を閉じる
+                        r.closeConnection(true);
+                        return r;
+                    }
+                    if (request == null) {
+                        return jsonError(Response.Status.BAD_REQUEST, "Invalid JSON");
+                    }
+                }
 
                 if (uri.equals("/")) {
                     return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\"}");
@@ -1076,6 +1203,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                         }
                         return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"balance\":" + user.balance + "}");
                     } catch (Exception e) {
+                        logApiError(uri, e);
                         return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\":\"ERROR\",\"message\":\"DB Error\"}");
                     }
                 } else if (uri.startsWith("/api/history/") || uri.startsWith("/api/fullhistory/")) {
@@ -1092,18 +1220,19 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                         List<PaymentHistory> history = mainclass.dbManager.getHistory(user.uuid, uri.startsWith("/api/history/") ? 100 : 0);
                         return newFixedLengthResponse(Response.Status.OK, "application/json", mainclass.mapper.writeValueAsString(history));
                     } catch (Exception e) {
+                        logApiError(uri, e);
                         return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "500 Internal Server Error (DB Error)");
                     }
                 } else if (uri.equals("/api/webcharge") && method == Method.POST) {
                     try {
-                        String body = getRequestBody(session);
-                        Map<String, Object> request = mainclass.mapper.readValue(body, Map.class);
                         String playerName = (String) request.get("playername");
                         String password = (String) request.get("password");
                         Object chargeBalanceObj = request.get("chargebalance");
                         if (playerName == null || password == null || chargeBalanceObj == null) {
                             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Missing required fields\"}");
                         }
+                        Response locked = checkAuthLock(playerName, clientIp);
+                        if (locked != null) return locked;
 
                         int chargeBalance;
                         try {
@@ -1118,9 +1247,8 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                         }
 
                         DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                        if (user == null || !user.webChargePassword.equals(password)) {
-                            return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "application/json", "{\"status\": \"ERROR\", \"message\": \"Invalid password\"}");
-                        }
+                        Response denied = verifyPassword(user, playerName, password, clientIp);
+                        if (denied != null) return denied;
 
                         if (chargeBalance <= 0 || user.balance + chargeBalance > 20000) {
                             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": " +
@@ -1132,126 +1260,134 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
 
                         return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"balance\": " + user.balance + "}");
                     } catch (Exception e) {
+                        logApiError(uri, e);
                         return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\": \"ERROR\", \"message\": \"Internal server error\"}");
                     }
                 } else if (uri.equals("/api/writecard") && method == Method.POST) {
                     try {
-                        String body = getRequestBody(session);
-                        Map<String, Object> request = mainclass.mapper.readValue(body, Map.class);
                         String playerName = (String) request.get("playername");
                         String password = (String) request.get("password");
                         String cardData = (String) request.get("carddata");
                         if (playerName == null || password == null || cardData == null) {
                             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Missing required fields\"}");
                         }
+                        Response locked = checkAuthLock(playerName, clientIp);
+                        if (locked != null) return locked;
 
                         UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
                         if (uuid == null) {
                             return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player not found\"}");
                         }
 
-                        Player onlinePlayer = Bukkit.getPlayer(uuid);
-                        if (onlinePlayer == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player must be online to write card\"}");
-                        }
+                        // プレイヤー・インベントリの操作はメインスレッドで行う
+                        return callSync(uri, () -> {
+                            Player onlinePlayer = Bukkit.getPlayer(uuid);
+                            if (onlinePlayer == null) {
+                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player must be online to write card\"}");
+                            }
 
-                        DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                        if (user == null || !user.webChargePassword.equals(password)) {
-                            return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "application/json", "{\"status\": \"ERROR\", \"message\": \"Invalid password\"}");
-                        }
+                            DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
+                            Response denied = verifyPassword(user, playerName, password, clientIp);
+                            if (denied != null) return denied;
 
-                        ItemStack item = findValidICCard(onlinePlayer);
-                        if (item == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"No valid IC card found in player's inventory\"}");
-                        }
+                            ItemStack item = findValidICCard(onlinePlayer);
+                            if (item == null) {
+                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"No valid IC card found in player's inventory\"}");
+                            }
 
-                        mainclass.writeCard(onlinePlayer, user, cardData, "Special::webwritecard");
-                        return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"balance\": " + user.balance + "}");
+                            mainclass.writeCard(onlinePlayer, user, cardData, "Special::webwritecard");
+                            return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"balance\": " + user.balance + "}");
+                        });
                     } catch (Exception e) {
+                        logApiError(uri, e);
                         return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\": \"ERROR\", \"message\": \"Internal server error\"}");
                     }
                 } else if (uri.equals("/api/getcardinfo") && method == Method.POST) {
                     try {
-                        String body = getRequestBody(session);
-                        Map<String, Object> request = mainclass.mapper.readValue(body, Map.class);
                         String playerName = (String) request.get("playername");
                         String password = (String) request.get("password");
                         if (playerName == null || password == null) {
                             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Missing required fields\"}");
                         }
+                        Response locked = checkAuthLock(playerName, clientIp);
+                        if (locked != null) return locked;
 
                         UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
                         if (uuid == null) {
                             return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player not found\"}");
                         }
 
-                        Player onlinePlayer = Bukkit.getPlayer(uuid);
-                        if (onlinePlayer == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player must be online\"}");
-                        }
+                        // プレイヤー・インベントリの参照はメインスレッドで行う
+                        return callSync(uri, () -> {
+                            Player onlinePlayer = Bukkit.getPlayer(uuid);
+                            if (onlinePlayer == null) {
+                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player must be online\"}");
+                            }
 
-                        DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                        if (user == null || !user.webChargePassword.equals(password)) {
-                            return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "application/json", "{\"status\": \"ERROR\", \"message\": \"Invalid password\"}");
-                        }
+                            DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
+                            Response denied = verifyPassword(user, playerName, password, clientIp);
+                            if (denied != null) return denied;
 
-                        ItemStack item = findValidICCard(onlinePlayer);
-                        if (item == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"No valid IC card found in player's inventory\"}");
-                        }
+                            ItemStack item = findValidICCard(onlinePlayer);
+                            if (item == null) {
+                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"No valid IC card found in player's inventory\"}");
+                            }
 
-                        Map<String, Object> cardInfo = mainclass.getCardInfoFromDB(user);
-                        if (cardInfo.isEmpty()) {
-                            return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"message\": \"No ticket information registered\"}");
-                        }
+                            Map<String, Object> cardInfo = mainclass.getCardInfoFromDB(user);
+                            if (cardInfo.isEmpty()) {
+                                return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"message\": \"No ticket information registered\"}");
+                            }
 
-                        return newFixedLengthResponse(Response.Status.OK, "application/json", mainclass.mapper.writeValueAsString(Map.of("status", "OK", "cardInfo", cardInfo)));
+                            return newFixedLengthResponse(Response.Status.OK, "application/json", mainclass.mapper.writeValueAsString(Map.of("status", "OK", "cardInfo", cardInfo)));
+                        });
                     } catch (Exception e) {
+                        logApiError(uri, e);
                         return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\": \"ERROR\", \"message\": \"Internal server error\"}");
                     }
                 } else if (uri.equals("/api/delcardinfo") && method == Method.POST) {
                     try {
-                        String body = getRequestBody(session);
-                        Map<String, Object> request = mainclass.mapper.readValue(body, Map.class);
                         String playerName = (String) request.get("playername");
                         String password = (String) request.get("password");
                         if (playerName == null || password == null) {
                             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Missing required fields\"}");
                         }
+                        Response locked = checkAuthLock(playerName, clientIp);
+                        if (locked != null) return locked;
 
                         UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
                         if (uuid == null) {
                             return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player not found\"}");
                         }
 
-                        Player onlinePlayer = Bukkit.getPlayer(uuid);
-                        if (onlinePlayer == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player must be online\"}");
-                        }
+                        // プレイヤー・インベントリの操作はメインスレッドで行う
+                        return callSync(uri, () -> {
+                            Player onlinePlayer = Bukkit.getPlayer(uuid);
+                            if (onlinePlayer == null) {
+                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player must be online\"}");
+                            }
 
-                        DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                        if (user == null || !user.webChargePassword.equals(password)) {
-                            return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "application/json", "{\"status\": \"ERROR\", \"message\": \"Invalid password\"}");
-                        }
+                            DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
+                            Response denied = verifyPassword(user, playerName, password, clientIp);
+                            if (denied != null) return denied;
 
-                        ItemStack item = findValidICCard(onlinePlayer);
-                        if (item == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"No valid IC card found in player's inventory\"}");
-                        }
+                            ItemStack item = findValidICCard(onlinePlayer);
+                            if (item == null) {
+                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"No valid IC card found in player's inventory\"}");
+                            }
 
-                        boolean deleted = mainclass.deleteCardInfoFromDB(user, onlinePlayer);
-                        if (!deleted) {
-                            return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"message\": \"No ticket information to delete\"}");
-                        }
+                            boolean deleted = mainclass.deleteCardInfoFromDB(user, onlinePlayer);
+                            if (!deleted) {
+                                return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"message\": \"No ticket information to delete\"}");
+                            }
 
-                        return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"message\": \"Ticket information deleted\"}");
+                            return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"message\": \"Ticket information deleted\"}");
+                        });
                     } catch (Exception e) {
+                        logApiError(uri, e);
                         return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\": \"ERROR\", \"message\": \"Internal server error\"}");
                     }
                 } else if (uri.equals("/api/pay") && method == Method.POST) {
                     try {
-                        String body = getRequestBody(session);
-                        Map<String, Object> request = mainclass.mapper.readValue(body, Map.class);
                         String playerName = (String) request.get("playername");
                         String password = (String) request.get("password");
                         Object amountObj = request.get("amount");
@@ -1259,6 +1395,8 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                         if (playerName == null || password == null || amountObj == null) {
                             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Missing required fields\"}");
                         }
+                        Response locked = checkAuthLock(playerName, clientIp);
+                        if (locked != null) return locked;
                         int amount;
                         try {
                             amount = Integer.parseInt(amountObj.toString());
@@ -1270,9 +1408,8 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                             return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player not found\"}");
                         }
                         DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                        if (user == null || !user.webChargePassword.equals(password)) {
-                            return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "application/json", "{\"status\": \"ERROR\", \"message\": \"Invalid password\"}");
-                        }
+                        Response denied = verifyPassword(user, playerName, password, clientIp);
+                        if (denied != null) return denied;
                         if (amount <= 0 || user.balance < amount) {
                             return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Insufficient balance or invalid amount\"}");
                         }
@@ -1282,6 +1419,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                         mainclass.dbManager.addHistory(user.uuid, h);
                         return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"balance\": " + user.balance + "}");
                     } catch (Exception e) {
+                        logApiError(uri, e);
                         return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\": \"ERROR\", \"message\": \"Internal server error\"}");
                     }
                 }
@@ -1293,11 +1431,95 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             }
         }
 
-        private String getRequestBody(IHTTPSession session) throws IOException {
-            int contentLength = Integer.parseInt(session.getHeaders().getOrDefault("content-length", "0"));
-            byte[] buffer = new byte[contentLength];
-            session.getInputStream().read(buffer, 0, contentLength);
-            return new String(buffer);
+        // ボディをサイズ上限付きで読み込み、JSONオブジェクトとして解析する (JSONオブジェクトでなければ null)
+        @SuppressWarnings("unchecked")
+        private Map<String, Object> readJsonBody(IHTTPSession session) throws IOException {
+            String body = RequestBodies.read(session.getInputStream(), session.getHeaders().get("content-length"), security.getMaxBodyBytes());
+            try {
+                Object parsed = mainclass.mapper.readValue(body, Object.class);
+                return parsed instanceof Map ? (Map<String, Object>) parsed : null;
+            } catch (JsonProcessingException e) {
+                return null;
+            }
+        }
+
+        // 読み取り系APIの保護。拒否する場合はレスポンスを、許可する場合は null を返す
+        private Response guardReadRoute(IHTTPSession session, String uri, String clientIp) throws SQLException {
+            long wait = security.tryAcquireRead(clientIp);
+            if (wait > 0) return tooManyRequests("Too many requests", wait);
+            if (!security.isRequireAuthForRead()) return null;
+
+            String playerName = uri.startsWith("/api/balance/") ? uri.substring("/api/balance/".length()) : uri.substring(uri.indexOf("/", 5) + 1);
+            // パスワードは X-TOROpass-Password ヘッダー、または password クエリパラメータで受け取る
+            String password = session.getHeaders().get("x-toropass-password");
+            if (password == null) {
+                List<String> values = session.getParameters().get("password");
+                if (values != null && !values.isEmpty()) password = values.get(0);
+            }
+            Response locked = checkAuthLock(playerName, clientIp);
+            if (locked != null) return locked;
+            if (password == null) return jsonError(Response.Status.UNAUTHORIZED, "Password required");
+
+            UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
+            if (uuid == null) return null; // 存在しないプレイヤーは各APIの処理で 404 を返す
+            return verifyPassword(mainclass.dbManager.getUser(uuid), playerName, password, clientIp);
+        }
+
+        // 認証失敗が続いてロック中のプレイヤー名・IPからのリクエストを拒否する
+        private Response checkAuthLock(String playerName, String clientIp) {
+            long remaining = security.lockRemainingMillis(playerName, clientIp);
+            if (remaining <= 0) return null;
+            return tooManyRequests("Too many failed attempts. Try again later.", remaining);
+        }
+
+        // パスワードを確認する。正しければ null、間違っていれば 401 レスポンスを返す
+        private Response verifyPassword(DatabaseManager.UserData user, String playerName, String password, String clientIp) {
+            if (user == null || !ApiSecurity.passwordMatches(user.webChargePassword, password)) {
+                if (security.recordFailure(playerName, clientIp, password)) {
+                    mainclass.getLogger().warning("Web API: 認証失敗が続いたため一時的にロックしました (player=" + sanitizeForLog(playerName) + ", ip=" + sanitizeForLog(clientIp) + ")");
+                }
+                return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "application/json", "{\"status\": \"ERROR\", \"message\": \"Invalid password\"}");
+            }
+            security.recordSuccess(playerName);
+            return null;
+        }
+
+        // Bukkit API を使う処理をメインスレッドで実行し、結果を待つ
+        private Response callSync(String uri, Callable<Response> task) throws Exception {
+            Future<Response> future = Bukkit.getScheduler().callSyncMethod(mainclass, task);
+            try {
+                return future.get(security.getSyncTimeoutMillis(), TimeUnit.MILLISECONDS);
+            } catch (TimeoutException e) {
+                if (!future.cancel(false)) {
+                    // 既に実行が始まっている場合は、処理済みなのに失敗を返さないよう完了を待つ
+                    return future.get(security.getSyncTimeoutMillis(), TimeUnit.MILLISECONDS);
+                }
+                mainclass.getLogger().warning("Web API: メインスレッドでの処理がタイムアウトしました (" + sanitizeForLog(uri) + ")");
+                return jsonError(Response.Status.SERVICE_UNAVAILABLE, "Server busy. Try again later.");
+            } catch (ExecutionException e) {
+                throw e.getCause() instanceof Exception cause ? cause : e;
+            }
+        }
+
+        private void logApiError(String uri, Exception e) {
+            mainclass.getLogger().log(Level.WARNING, "Web API エラー (" + sanitizeForLog(uri) + ")", e);
+        }
+
+        private static Response tooManyRequests(String message, long retryAfterMillis) {
+            Response r = jsonError(Response.Status.TOO_MANY_REQUESTS, message);
+            r.addHeader("Retry-After", String.valueOf(Math.max(1, (retryAfterMillis + 999) / 1000)));
+            return r;
+        }
+
+        // message には固定の文字列のみを渡すこと
+        private static Response jsonError(Response.IStatus status, String message) {
+            return newFixedLengthResponse(status, "application/json", "{\"status\": \"ERROR\", \"message\": \"" + message + "\"}");
+        }
+
+        private static String sanitizeForLog(String value) {
+            if (value == null) return "null";
+            String s = value.replaceAll("\\p{Cntrl}", "?");
+            return s.length() > 64 ? s.substring(0, 64) + "..." : s;
         }
     }
 
@@ -1399,7 +1621,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             player.sendMessage(ChatColor.GREEN + "Webから定期券情報を削除しました。");
             return true;
         } catch (SQLException e) {
-            player.sendMessage(ChatColor.RED + "DBエラー: " + e.getMessage());
+            sendInternalError(player, "DBエラー", e);
             return false;
         }
     }
