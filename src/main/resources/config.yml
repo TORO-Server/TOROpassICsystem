@@ -7,30 +7,94 @@ iccard-names:
   7: "TOHOCA"
   default: "TOROpass"
 
+# チャージの設定
+charge:
+  # false にすると /api/webcharge でのチャージを止めます (Wallet のログイン確認は引き続き使えます)
+  web-charge-enabled: true
+  # false にするとオートチャージの設定と実行を止めます
+  auto-charge-enabled: true
+
+# 定期券コード (/writecard, /api/writecard) の検証
+# 既定の設定は、発売機が現在発行しているコードをそのまま受け付けます
+card-codes:
+  # true にすると signing-secret で署名されたコードだけを受け付けます (発売機側の対応が必要です)
+  # コードの末尾に -sig.<署名> を付けます。署名は CardCodes.computeSignature を参照してください
+  require-signature: false
+  # HMAC-SHA256 の秘密鍵。空でなければ、署名付きのコードは require-signature が false でも検証します
+  signing-secret: ""
+  # 今日から何日先までの有効期限を受け付けるか (0 で無制限)
+  max-validity-days: 0
+  # 購入金額の下限と上限 (0 で制限なし)
+  min-purchase-amount: 0
+  max-purchase-amount: 0
+
+# 特殊看板の確認
+signs:
+  # true にすると、権限のあるプレイヤーが作成または編集して印が付いた
+  # [チャージ] [物販] [TOROpass販売] の看板だけを使えるようにします
+  # 既存の看板には印がないので、有効にする前に管理者が編集し直してください
+  require-authorized-mark: false
+
+# /toropassrank
+ranking:
+  # 集計結果を再利用する時間 (秒)
+  cache-seconds: 300
+  # 同じプレイヤーが再度実行できるまでの時間 (秒)
+  cooldown-seconds: 5
+
 # Web API (Wallet) のセキュリティ設定
 # 既存の config.yml にこのセクションがない場合は、以下のデフォルト値が使われます
 api:
-  # true にすると /api/balance, /api/history, /api/fullhistory でもパスワードが必要になります
-  # パスワードは X-TOROpass-Password ヘッダー または ?password= クエリで渡します
-  # (現在の Wallet はパスワードを送信しないため、有効にする前に Wallet 側の対応が必要です)
-  require-auth-for-read: false
+  # /api/balance, /api/history, /api/fullhistory でパスワードを必須にします
+  # パスワードは X-TOROpass-Password ヘッダーで渡します
+  require-auth-for-read: true
   # クライアントIPを取得するヘッダー名 (リバースプロキシ経由の場合)
-  # 空文字にすると接続元アドレスを使用します
-  # ※ APIのポートに直接アクセスできる環境では、このヘッダーは偽装できます
+  # 空文字にすると常に接続元アドレスを使用します
   client-ip-header: "CF-Connecting-IP"
+  # client-ip-header を信頼する接続元 (CIDR)。接続元がこの範囲外ならヘッダーは無視します
+  trusted-proxies:
+    - "127.0.0.0/8"
+    - "::1/128"
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+    - "fc00::/7"
+  # API が直接 CORS を許可するオリジン (例: https://toro-server.github.io)
+  # CORS に対応したプロキシを経由している間は空のままにしてください (ヘッダーが二重になります)
+  cors-allowed-origins: []
+  # 待ち受けるアドレス (空文字で全インターフェース)
+  bind-address: ""
+  # HTTP の処理スレッド数の上限と、処理を待つ接続数の上限 (超えた接続はすぐに閉じます)
+  max-workers: 32
+  max-queued-connections: 64
   # POSTリクエストのボディの最大サイズ (バイト)。超えた場合は 413 を返します
   max-body-bytes: 16384
   # メインスレッドでの処理 (/api/writecard など) を待つ最大時間 (ミリ秒)
   sync-timeout-ms: 5000
-  # パスワード認証の失敗制限 (プレイヤー名ごと・クライアントIPごとに適用)
-  # window-seconds 秒以内に max-failures 回失敗すると、lockout-seconds 秒間 429 を返します
-  # 同じパスワードでの再試行は 1 回として数えます。認証に成功するとプレイヤー名側の回数はリセットされます
+  # パスワードの有効期限
+  web-password:
+    # /webcharge で発行したパスワードの有効日数 (0 で無期限)
+    ttl-days: 90
+    # 以前の 8 文字のパスワードを、この版へ更新してから何日使えるようにするか
+    legacy-grace-days: 30
+  # パスワード認証の失敗制限
+  # window-seconds 秒以内に、同じプレイヤー名とクライアントIPの組で max-failures 回、
+  # または同じクライアントIPで ip-max-failures 回失敗すると、lockout-seconds 秒間 429 を返します
+  # 同じパスワードでの再試行は 1 回として数えます。認証に成功すると組の回数はリセットされ、/webcharge を実行するとロックも解除されます
   auth-throttle:
     max-failures: 5
+    ip-max-failures: 30
     window-seconds: 600
     lockout-seconds: 900
+    # 同じプレイヤー名への失敗が name-delay-after-failures 回を超えると、ロックはせず認証の応答を遅らせます (最大 name-delay-max-ms ミリ秒)
+    name-delay-after-failures: 5
+    name-delay-max-ms: 2000
   # 読み取り系API (/api/balance, /api/history, /api/fullhistory) のクライアントIPごとのリクエスト数制限
   # window-seconds 秒あたり max-requests 回まで (0 で無制限)
   read-rate-limit:
+    max-requests: 240
+    window-seconds: 60
+  # POST API のクライアントIPごとのリクエスト数制限 (Wallet は開いている間 5 秒ごとに 1 回送信します)
+  write-rate-limit:
     max-requests: 240
     window-seconds: 60

@@ -1,29 +1,34 @@
 name: TOROpassICsystem
-version: 1.7
+version: ${version}
 main: prj.salmon.toropassicsystem.TOROpassICsystem
 api-version: 1.20
 commands:
   charge:
     description: "ICカードに金額をチャージします"
     usage: "/charge [金額]"
+    permission: toropassicsystem.admin
   autocharge:
     description: "ICカードにオートチャージを設定します"
     usage: "/autocharge [いくらを下回ったとき] [チャージ額] または /autocharge stop"
+    permission: toropassicsystem.autocharge
   writecard:
     description: "ICカードに定期券情報を書き込みます"
     usage: "TOROpassの発売機で定期券データをコピーし、Minecraft内で貼り付けて実行してください"
+    permission: toropassicsystem.writecard
   toropassrank:
     description: "TOROpassを使って移動した距離のランキングを表示します"
     usage: "/toropassrank を打ち込むだけです"
+    permission: toropassicsystem.toropassrank
   webcharge:
     description: "Walletを使用するためのパスワードを設定します。コマンドを実行するたびにパスワードが変更されます。"
-    usage: "/webcharge を打ち込むだけです"
+    usage: "/webcharge でパスワードを発行し、/webcharge revoke で無効にします"
+    permission: toropassicsystem.webcharge
 permissions:
   toropassicsystem.admin:
-    description: "TOROpassの管理者権限 (特殊看板設置・残額調整など)"
+    description: "TOROpassの管理者権限 (特殊看板設置・残額調整・/charge など)"
     default: op
   toropassicsystem.charge:
-    description: "チャージコマンドの使用を許可します"
+    description: "使用していません。/charge は toropassicsystem.admin で判定します"
     default: op
   toropassicsystem.autocharge:
     description: "オートチャージ設定の使用を許可します"

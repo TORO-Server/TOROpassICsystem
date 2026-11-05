@@ -22,6 +22,22 @@ class RequestBodiesTest {
     }
 
     @Test
+    void discardReadsAtMostTheLimit() {
+        ByteArrayInputStream in = new ByteArrayInputStream(new byte[100]);
+        RequestBodies.discard(in, "100", 30);
+        assertEquals(70, in.available());
+        RequestBodies.discard(in, "50", 1000);
+        assertEquals(20, in.available());
+        // 長さが不正なら何もしない
+        RequestBodies.discard(in, "abc", 1000);
+        RequestBodies.discard(in, null, 1000);
+        assertEquals(20, in.available());
+        // 宣言より短くても止まらない
+        RequestBodies.discard(in, "1000", 1000);
+        assertEquals(0, in.available());
+    }
+
+    @Test
     void readsWholeBodyEvenWhenDeliveredInPieces() throws IOException {
         byte[] body = "{\"playername\":\"とろ\",\"password\":\"abc\"}".getBytes(StandardCharsets.UTF_8);
         String result = RequestBodies.read(trickle(body), String.valueOf(body.length), 16384);

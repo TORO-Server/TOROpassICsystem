@@ -17,18 +17,8 @@ public class TOROpassICsystemAPI {
             return false; // 負の額の引き去りは無効
         }
         try {
-            DatabaseManager.UserData user = plugin.dbManager.getUser(player.getUniqueId());
-            if (user == null) return false;
-            if (user.balance >= amount) {
-                user.balance -= amount;
-                user.lastupdate = System.currentTimeMillis() / 1000L;
-                plugin.dbManager.upsertUser(user);
-                PaymentHistory h = PaymentHistory.build("Other::deduct", "他のプラグインから引き去り", -amount, user.balance, System.currentTimeMillis() / 1000L, null);
-                plugin.dbManager.addHistory(user.uuid, h);
-                return true;
-            } else {
-                return false;
-            }
+            PaymentHistory h = PaymentHistory.build("Other::deduct", "他のプラグインから引き去り", -amount, 0, System.currentTimeMillis() / 1000L, null);
+            return plugin.dbManager.debit(player.getUniqueId(), amount, h).isPresent();
         } catch (Exception e) {
             return false;
         }
