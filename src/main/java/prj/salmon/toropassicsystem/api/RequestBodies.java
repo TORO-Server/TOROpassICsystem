@@ -27,6 +27,22 @@ public final class RequestBodies {
         return new String(buffer, StandardCharsets.UTF_8);
     }
 
+    // 読まないボディを maxBytes まで読み捨てる。読み残したまま接続を閉じると、クライアントが応答を受け取る前に接続がリセットされることがある
+    public static void discard(InputStream in, String contentLengthHeader, int maxBytes) {
+        if (contentLengthHeader == null || contentLengthHeader.isBlank()) return;
+        try {
+            long remaining = Math.min(Long.parseLong(contentLengthHeader.trim()), maxBytes);
+            byte[] buffer = new byte[4096];
+            while (remaining > 0) {
+                int read = in.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                if (read < 0) return;
+                remaining -= read;
+            }
+        } catch (NumberFormatException | IOException ignored) {
+            // 接続を閉じるだけなので、読めなくても構わない
+        }
+    }
+
     public static class BodyException extends IOException {
         private final int status;
 

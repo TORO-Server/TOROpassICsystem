@@ -95,4 +95,49 @@ class AuthThrottleTest {
         t.recordFailure("new-key", "pw");
         assertEquals(1, t.trackedKeys());
     }
+
+    @Test
+    void keysAboveTheLimitShareOneEntry() {
+        AuthThrottle t = new AuthThrottle(5, 600_000, 600_000, 100, now::get);
+        for (int i = 0; i < 1000; i++) t.recordFailure("key" + i, "pw");
+        // 上限と共有エントリの分を超えて増えない
+        assertTrue(t.trackedKeys() <= 101);
+        // 上限に達している間の新しいキーは、共有エントリの失敗回数でロックされる
+        for (int i = 0; i < 5; i++) t.recordFailure("overflow" + i, "pw" + i);
+        assertTrue(t.remainingLockMillis("another-new-key") > 0);
+        // 追跡中のキーは影響を受けない
+        assertEquals(0, t.remainingLockMillis("key0"));
+    }
+
+    @Test
+    void failureCountReportsDistinctAttempts() {
+        AuthThrottle t = throttle(Integer.MAX_VALUE, 600_000, 900_000);
+        assertEquals(0, t.failureCount("alice"));
+        t.recordFailure("alice", "pw0");
+        t.recordFailure("alice", "pw0");
+        t.recordFailure("alice", "pw1");
+        assertEquals(2, t.failureCount("alice"));
+        now.addAndGet(600_001);
+        assertEquals(0, t.failureCount("alice"));
+    }
+
+    @Test
+    void remembersALimitedNumberOfAttemptsPerKey() {
+        AuthThrottle t = throttle(Integer.MAX_VALUE, 600_000, 900_000);
+        for (int i = 0; i < 5000; i++) t.recordFailure("alice", "pw" + i);
+        assertTrue(t.failureCount("alice") <= 256);
+    }
+
+    @Test
+    void clearMatchingRemovesLocks() {
+        AuthThrottle t = throttle(2, 600_000, 900_000);
+        t.recordFailure("alice|a", "pw0");
+        t.recordFailure("alice|a", "pw1");
+        t.recordFailure("bob|a", "pw0");
+        t.recordFailure("bob|a", "pw1");
+        assertTrue(t.remainingLockMillis("alice|a") > 0);
+        t.clearMatching(key -> key.startsWith("alice|"));
+        assertEquals(0, t.remainingLockMillis("alice|a"));
+        assertTrue(t.remainingLockMillis("bob|a") > 0);
+    }
 }

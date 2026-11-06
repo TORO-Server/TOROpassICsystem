@@ -4,28 +4,43 @@ plugins {
 }
 
 group = 'prj.salmon'
-version = '1.5'
+version = '1.8'
 
 repositories {
-    mavenCentral()
+    mavenCentral {
+        content {
+            excludeGroup 'org.spigotmc'
+        }
+    }
     maven {
         name = "spigotmc-repo"
         url = "https://hub.spigotmc.org/nexus/content/repositories/snapshots/"
+        content {
+            includeGroup 'org.spigotmc'
+        }
     }
     maven {
         name = "sonatype"
         url = "https://oss.sonatype.org/content/groups/public/"
+        content {
+            includeGroup 'net.md-5'
+        }
     }
 }
 
+def jacksonVersion = '2.22.4'
+
 dependencies {
     compileOnly "org.spigotmc:spigot-api:1.20.4-R0.1-SNAPSHOT"
-    implementation 'com.fasterxml.jackson.core:jackson-databind:2.13.4.2'
+    implementation "com.fasterxml.jackson.core:jackson-core:${jacksonVersion}"
+    implementation "com.fasterxml.jackson.core:jackson-databind:${jacksonVersion}"
     implementation "org.nanohttpd:nanohttpd:2.3.1"
 
     testImplementation platform("org.junit:junit-bom:5.10.2")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+    // 実行時はサーバー本体に含まれる SQLite ドライバーを使う
+    testRuntimeOnly "org.xerial:sqlite-jdbc:3.49.1.0"
 }
 
 test {
@@ -57,6 +72,15 @@ processResources {
     filesMatching('plugin.yml') {
         expand props
     }
+}
+
+shadowJar {
+    // 他のプラグインが持つ同じライブラリと衝突しないよう、同梱するライブラリを移動する
+    relocate 'com.fasterxml.jackson', 'prj.salmon.toropassicsystem.libs.jackson'
+    relocate 'fi.iki.elonen', 'prj.salmon.toropassicsystem.libs.nanohttpd'
+    // Multi-Release のクラスは結合した JAR では読み込まれないので含めない
+    exclude 'META-INF/versions/**'
+    exclude 'module-info.class'
 }
 
 build.dependsOn shadowJar

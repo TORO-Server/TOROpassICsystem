@@ -46,4 +46,18 @@ class RateLimiterTest {
         limiter.tryAcquire("another");
         assertEquals(1, limiter.trackedKeys());
     }
+
+    @Test
+    void keysAboveTheLimitShareOneWindow() {
+        RateLimiter limiter = new RateLimiter(3, 60_000, 50, now::get);
+        for (int i = 0; i < 50; i++) limiter.tryAcquire("ip" + i);
+        // 上限に達している間は、新しいキーをいくつ使っても追跡数は増えず、共有の制限を受ける
+        assertEquals(0, limiter.tryAcquire("new-1"));
+        assertEquals(0, limiter.tryAcquire("new-2"));
+        assertEquals(0, limiter.tryAcquire("new-3"));
+        assertTrue(limiter.tryAcquire("new-4") > 0);
+        assertTrue(limiter.trackedKeys() <= 51);
+        // 追跡中のキーは自分のウィンドウで数える
+        assertEquals(0, limiter.tryAcquire("ip0"));
+    }
 }

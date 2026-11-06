@@ -1,8 +1,7 @@
 package prj.salmon.toropassicsystem;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import fi.iki.elonen.NanoHTTPD;
+import net.md_5.bungee.api.chat.ClickEvent;
+import net.md_5.bungee.api.chat.TextComponent;
 import org.bukkit.*;
 import org.bukkit.block.Block;
 import org.bukkit.block.Sign;
@@ -25,63 +24,75 @@ import org.bukkit.event.vehicle.VehicleMoveEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
+import org.bukkit.plugin.IllegalPluginAccessException;
 import org.bukkit.plugin.java.JavaPlugin;
 import prj.salmon.toropassicsystem.api.ApiSecurity;
-import prj.salmon.toropassicsystem.api.RequestBodies;
+import prj.salmon.toropassicsystem.api.ApiServer;
+import prj.salmon.toropassicsystem.api.CardCodes;
+import prj.salmon.toropassicsystem.api.WebPasswords;
 import prj.salmon.toropassicsystem.types.PaymentHistory;
-// import prj.salmon.toropassicsystem.types.SavingData;
-// import prj.salmon.toropassicsystem.types.SavingDataJson;
 
 import java.io.IOException;
-import java.security.SecureRandom;
 import java.sql.SQLException;
-import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.*;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExecutor {
-    final HashMap<UUID, StationData> playerData = new HashMap<>();
-    private HTTPServer httpserver;
+    private static final int API_PORT = 5744;
+    private static final long SECONDS_PER_DAY = 86400L;
 
-    private final NamespacedKey customModelDataKey = new NamespacedKey(this, "custom_model_data");
-    private final NamespacedKey ticketTypeKey = new NamespacedKey(this, "ticket_type");
-    private final NamespacedKey companyCodeKey = new NamespacedKey(this, "company_code");
-    private final NamespacedKey purchaseAmountKey = new NamespacedKey(this, "purchase_amount");
-    private final NamespacedKey expiryDateKey = new NamespacedKey(this, "expiry_date");
-    private final NamespacedKey checkDigitKey = new NamespacedKey(this, "check_digit");
-    private final NamespacedKey routeStartKey = new NamespacedKey(this, "route_start");
-    private final NamespacedKey routeEndKey = new NamespacedKey(this, "route_end");
+    final HashMap<UUID, StationData> playerData = new HashMap<>();
+    private final Map<UUID, Long> rankCommandUsedAt = new HashMap<>();
+    private ApiServer httpserver;
+    private ApiSecurity apiSecurity;
+    private RankingService rankingService;
+
+    private final NamespacedKey signMarkKey = new NamespacedKey(this, "authorized_sign");
+
+    private CardCodes.Settings cardCodeSettings;
+    private boolean autoChargeEnabled;
+    private boolean requireSignMark;
+    private long rankCooldownMillis;
+    private long webPasswordTtlSeconds;
 
     public DatabaseManager dbManager;
-
-    private final ObjectMapper mapper = new ObjectMapper();
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
+        cardCodeSettings = loadCardCodeSettings();
+        autoChargeEnabled = getConfig().getBoolean("charge.auto-charge-enabled", true);
+        requireSignMark = getConfig().getBoolean("signs.require-authorized-mark", false);
+        rankCooldownMillis = Math.max(0, getConfig().getLong("ranking.cooldown-seconds", 5)) * 1000L;
+        webPasswordTtlSeconds = Math.max(0, getConfig().getLong("api.web-password.ttl-days", 90)) * SECONDS_PER_DAY;
+        long legacyPasswordSeconds = Math.max(0, getConfig().getLong("api.web-password.legacy-grace-days", 30)) * SECONDS_PER_DAY;
         try {
             dbManager = new DatabaseManager(getDataFolder() + "/toropass.db");
-            dbManager.connect();
+            dbManager.connect(legacyPasswordSeconds);
         } catch (Exception e) {
             getLogger().severe("DB初期化失敗: " + e.getMessage());
             throw new RuntimeException(e);
         }
+        long rankingCacheMillis = Math.max(0, getConfig().getLong("ranking.cache-seconds", 300)) * 1000L;
+        rankingService = new RankingService(dbManager, task -> Bukkit.getScheduler().runTaskAsynchronously(this, task), rankingCacheMillis, System::currentTimeMillis);
         Bukkit.getPluginManager().registerEvents(this, this);
         getCommand("charge").setExecutor(this);
         getCommand("autocharge").setExecutor(this);
         getCommand("writecard").setExecutor(this);
         getCommand("toropassrank").setExecutor(this);
         getCommand("webcharge").setExecutor(this);
+        ApiSecurity.Settings apiSettings = loadApiSettings();
+        apiSecurity = new ApiSecurity(apiSettings, System::currentTimeMillis,
+                invalid -> getLogger().warning("api.trusted-proxies の値を解釈できません: " + invalid));
         try {
-            httpserver = new HTTPServer(5744, this, new ApiSecurity(loadApiSettings()));
+            httpserver = new ApiServer(API_PORT, apiSettings, apiSecurity, dbManager, new BukkitBridge(), getLogger());
         } catch (IOException e) {
             getLogger().warning(e.getMessage());
         }
@@ -89,29 +100,86 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
 
     @Override
     public void onDisable() {
+        // 処理中のリクエストが閉じた DB を使わないよう、先に API を止める
+        if (httpserver != null) httpserver.stop();
         try {
             if (dbManager != null) dbManager.close();
         } catch (Exception e) {
             getLogger().warning("DBクローズ失敗: " + e.getMessage());
         }
-        if (httpserver != null) httpserver.stop();
     }
 
     // config.yml の api セクションを読み込む (項目がない場合は安全なデフォルト値を使用)
     private ApiSecurity.Settings loadApiSettings() {
         ApiSecurity.Settings settings = new ApiSecurity.Settings();
+        settings.webChargeEnabled = getConfig().getBoolean("charge.web-charge-enabled", settings.webChargeEnabled);
         ConfigurationSection api = getConfig().getConfigurationSection("api");
         if (api == null) return settings;
         settings.requireAuthForRead = api.getBoolean("require-auth-for-read", settings.requireAuthForRead);
         settings.clientIpHeader = api.getString("client-ip-header", settings.clientIpHeader);
+        if (api.isList("trusted-proxies")) settings.trustedProxies = api.getStringList("trusted-proxies");
+        if (api.isList("cors-allowed-origins")) settings.corsAllowedOrigins = api.getStringList("cors-allowed-origins");
+        settings.bindAddress = api.getString("bind-address", settings.bindAddress);
+        settings.maxWorkers = api.getInt("max-workers", settings.maxWorkers);
+        settings.maxQueuedConnections = api.getInt("max-queued-connections", settings.maxQueuedConnections);
         settings.maxBodyBytes = api.getInt("max-body-bytes", settings.maxBodyBytes);
         settings.syncTimeoutMillis = api.getLong("sync-timeout-ms", settings.syncTimeoutMillis);
         settings.authMaxFailures = api.getInt("auth-throttle.max-failures", settings.authMaxFailures);
+        settings.authIpMaxFailures = api.getInt("auth-throttle.ip-max-failures", settings.authIpMaxFailures);
         settings.authWindowSeconds = api.getLong("auth-throttle.window-seconds", settings.authWindowSeconds);
         settings.authLockoutSeconds = api.getLong("auth-throttle.lockout-seconds", settings.authLockoutSeconds);
+        settings.authNameDelayAfter = api.getInt("auth-throttle.name-delay-after-failures", settings.authNameDelayAfter);
+        settings.authNameDelayMaxMillis = api.getLong("auth-throttle.name-delay-max-ms", settings.authNameDelayMaxMillis);
         settings.readMaxRequests = api.getInt("read-rate-limit.max-requests", settings.readMaxRequests);
         settings.readWindowSeconds = api.getLong("read-rate-limit.window-seconds", settings.readWindowSeconds);
+        settings.writeMaxRequests = api.getInt("write-rate-limit.max-requests", settings.writeMaxRequests);
+        settings.writeWindowSeconds = api.getLong("write-rate-limit.window-seconds", settings.writeWindowSeconds);
         return settings;
+    }
+
+    // config.yml の card-codes セクションを読み込む (既定では発売機の現在のコードをそのまま受け付ける)
+    private CardCodes.Settings loadCardCodeSettings() {
+        CardCodes.Settings settings = new CardCodes.Settings();
+        settings.requireSignature = getConfig().getBoolean("card-codes.require-signature", settings.requireSignature);
+        settings.signingSecret = getConfig().getString("card-codes.signing-secret", settings.signingSecret);
+        settings.maxValidityDays = getConfig().getInt("card-codes.max-validity-days", settings.maxValidityDays);
+        settings.minPurchaseAmount = getConfig().getInt("card-codes.min-purchase-amount", settings.minPurchaseAmount);
+        settings.maxPurchaseAmount = getConfig().getInt("card-codes.max-purchase-amount", settings.maxPurchaseAmount);
+        if (settings.requireSignature && (settings.signingSecret == null || settings.signingSecret.isEmpty())) {
+            getLogger().severe("card-codes.require-signature が有効ですが signing-secret が空です。定期券コードはすべて拒否されます。");
+        }
+        return settings;
+    }
+
+    // API から使うゲーム側の処理
+    private final class BukkitBridge implements ApiServer.GameBridge {
+        @Override
+        public <T> Future<T> callSync(Callable<T> task) {
+            return Bukkit.getScheduler().callSyncMethod(TOROpassICsystem.this, task);
+        }
+
+        @Override
+        public boolean isOnline(UUID uuid) {
+            return Bukkit.getPlayer(uuid) != null;
+        }
+
+        @Override
+        public boolean hasICCard(UUID uuid) {
+            Player player = Bukkit.getPlayer(uuid);
+            return player != null && findValidICCard(player) != null;
+        }
+
+        @Override
+        public boolean writeCard(UUID uuid, String cardData) {
+            Player player = Bukkit.getPlayer(uuid);
+            return player != null && TOROpassICsystem.this.writeCard(player, cardData, "Special::webwritecard");
+        }
+
+        @Override
+        public void notifyPlayer(UUID uuid, String message) {
+            Player player = Bukkit.getPlayer(uuid);
+            if (player != null) player.sendMessage(ChatColor.GREEN + message);
+        }
     }
 
     // 内部エラーの詳細はサーバーログにのみ出力し、プレイヤーには一般的なメッセージを表示する
@@ -127,21 +195,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             return true;
         }
         try {
-            DatabaseManager.UserData user = dbManager.getUser(player.getUniqueId());
-            if (user == null) {
-                user = new DatabaseManager.UserData();
-                user.uuid = player.getUniqueId();
-                user.playername = player.getName();
-                user.balance = 0;
-                user.lastupdate = System.currentTimeMillis() / 1000L;
-                dbManager.upsertUser(user);
-            } else {
-                if (!player.getName().equals(user.playername)) {
-                    user.playername = player.getName();
-                    user.lastupdate = System.currentTimeMillis() / 1000L;
-                    dbManager.upsertUser(user);
-                }
-            }
+            DatabaseManager.UserData user = dbManager.ensureUser(player.getUniqueId(), player.getName());
             if (command.getName().equalsIgnoreCase("charge")) {
                 if (!player.hasPermission("toropassicsystem.admin")) {
                     player.sendMessage(ChatColor.RED + "チャージコマンドを実行する権限がありません。");
@@ -158,16 +212,16 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     player.sendMessage(ChatColor.RED + "チャージ額が不正です");
                     return true;
                 }
-                if (amount <= 0 || user.balance + amount > 20000) {
-                    player.sendMessage(ChatColor.RED + (amount <= 0 ? "チャージ額が不正です" : "最大チャージ額は20000トロポまでです"));
+                if (amount <= 0) {
+                    player.sendMessage(ChatColor.RED + "チャージ額が不正です");
                     return true;
                 }
-                user.balance += amount;
-                user.lastupdate = System.currentTimeMillis() / 1000L;
-                dbManager.upsertUser(user);
-                PaymentHistory h = PaymentHistory.build("Special::charge", "", amount, user.balance, System.currentTimeMillis() / 1000L, "チャージ");
-                dbManager.addHistory(user.uuid, h);
-                player.sendMessage(ChatColor.GREEN + String.valueOf(amount) + "トロポをチャージしました。現在の残高: " + user.balance + "トロポ");
+                OptionalInt balance = dbManager.credit(user.uuid, amount, DatabaseManager.MAX_BALANCE, chargeHistory(amount));
+                if (balance.isEmpty()) {
+                    player.sendMessage(ChatColor.RED + "最大チャージ額は20000トロポまでです");
+                    return true;
+                }
+                player.sendMessage(ChatColor.GREEN + String.valueOf(amount) + "トロポをチャージしました。現在の残高: " + balance.getAsInt() + "トロポ");
                 return true;
             }
 
@@ -180,18 +234,18 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                             player.sendMessage(ChatColor.RED + (threshold < 0 || amount <= 0 ? "不正な値です" : "1万トロポを超える設定はできません"));
                             return true;
                         }
-                        user.autoChargeThreshold = threshold;
-                        user.autoChargeAmount = amount;
+                        if (!autoChargeEnabled) {
+                            player.sendMessage(ChatColor.RED + "オートチャージは現在利用できません。");
+                            return true;
+                        }
+                        dbManager.updateAutoCharge(user.uuid, threshold, amount);
                         player.sendMessage(ChatColor.GREEN + "残高が " + threshold + "トロポを下回った場合に " + amount + "トロポをチャージします。");
-                        dbManager.upsertUser(user);
                     } catch (NumberFormatException e) {
                         player.sendMessage(ChatColor.RED + "無効な数値が入力されました。");
                     }
                 } else if (args.length == 1 && args[0].equalsIgnoreCase("stop")) {
-                    user.autoChargeThreshold = null;
-                    user.autoChargeAmount = null;
+                    dbManager.updateAutoCharge(user.uuid, null, null);
                     player.sendMessage(ChatColor.GREEN + "オートチャージが停止されました。");
-                    dbManager.upsertUser(user);
                 } else {
                     player.sendMessage(ChatColor.RED + "使用方法: /autocharge <閾値> <チャージ額> または /autocharge stop");
                 }
@@ -203,93 +257,22 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     player.sendMessage(ChatColor.RED + "使用方法: /writecard <券種>-<事業者コード>-<購入金額>-<有効期限>-<チェックデジット>[-<区間開始>-<区間終了>]");
                     return true;
                 }
-                writeCard(player, user, args[0], "Special::writecard");
+                writeCard(player, args[0], "Special::writecard");
                 return true;
             }
 
             if (command.getName().equalsIgnoreCase("toropassrank")) {
-                Map<UUID, Integer> consumptionMap = new HashMap<>();
-                int totalConsumptionAllUsers = 0;
-                try {
-                    List<DatabaseManager.UserData> allUsers = dbManager.getAllUsers();
-                    for (DatabaseManager.UserData u : allUsers) {
-                        List<PaymentHistory> history = dbManager.getHistory(u.uuid, 0); // 全履歴
-                        int totalConsumption = history.stream()
-                            .filter(h -> !h.from.startsWith("Special::") && !h.from.startsWith("Shop::"))
-                            .mapToInt(h -> Math.abs(h.amount))
-                            .sum();
-                        totalConsumptionAllUsers += totalConsumption;
-                        if (totalConsumption > 0) consumptionMap.put(u.uuid, totalConsumption);
-                    }
-                } catch (Exception e) {
-                    sendInternalError(player, "ランキング取得エラー", e);
-                    return true;
-                }
-
-                List<Map.Entry<UUID, Integer>> sortedRanking = consumptionMap.entrySet().stream()
-                        .sorted(Map.Entry.<UUID, Integer>comparingByValue().reversed())
-                        .limit(10)
-                        .toList();
-
-                player.sendMessage(ChatColor.GOLD + "=====TOROpass 移動量ランキング=====");
-                int currentRank = 0, previousConsumption = -1, sameRankCount = 0;
-                boolean playerInTop10 = false;
-
-                for (Map.Entry<UUID, Integer> entry : sortedRanking) {
-                    int consumption = entry.getValue();
-                    if (consumption != previousConsumption) {
-                        currentRank += sameRankCount + 1;
-                        sameRankCount = 0;
-                    } else sameRankCount++;
-                    previousConsumption = consumption;
-
-                    String playerName = Objects.requireNonNullElse(Bukkit.getOfflinePlayer(entry.getKey()).getName(), "不明なプレイヤー");
-                    String distance = formatDistance(consumption * 5.0);
-                    String message = ChatColor.YELLOW + String.valueOf(currentRank) + "位 " + playerName + " " + consumption + "トロポ " + distance;
-                    if (entry.getKey().equals(player.getUniqueId())) {
-                        message += " (自分)";
-                        playerInTop10 = true;
-                    }
-                    player.sendMessage(message);
-                }
-
-                if (!playerInTop10) {
-                    int playerConsumption = 0;
-                    try {
-                        List<PaymentHistory> myHistory = dbManager.getHistory(player.getUniqueId(), 0);
-                        playerConsumption = myHistory.stream()
-                            .filter(h -> !h.from.startsWith("Special::") && !h.from.startsWith("Shop::"))
-                            .mapToInt(h -> Math.abs(h.amount))
-                            .sum();
-                    } catch (Exception e) {
-                        sendInternalError(player, "ランキング取得エラー", e);
-                    }
-                    int playerRank = 1, playerSameRankCount = 0;
-                    for (Map.Entry<UUID, Integer> entry : consumptionMap.entrySet().stream()
-                            .sorted(Map.Entry.<UUID, Integer>comparingByValue().reversed())
-                            .toList()) {
-                        if (entry.getKey().equals(player.getUniqueId())) break;
-                        if (entry.getValue() == playerConsumption) playerSameRankCount++;
-                        else {
-                            playerRank += playerSameRankCount + 1;
-                            playerSameRankCount = 0;
-                        }
-                    }
-                    String playerDistance = formatDistance(playerConsumption * 5.0);
-                    player.sendMessage(ChatColor.YELLOW + String.valueOf(playerRank) + "位 " + player.getName() + "(あなた) " + playerConsumption + "トロポ " + playerDistance);
-                }
-
-                String totalDistance = formatDistance(totalConsumptionAllUsers * 5.0);
-                player.sendMessage(ChatColor.GOLD + "全ユーザーの移動量: " + totalConsumptionAllUsers + "トロポ " + totalDistance);
+                showRanking(player);
                 return true;
             }
 
             if (command.getName().equalsIgnoreCase("webcharge")) {
-                String password = generateRandomPassword(8);
-                user.webChargePassword = password;
-                dbManager.upsertUser(user);
-                player.sendMessage(ChatColor.GREEN + "Webチャージ用パスワードを生成しました: " + password);
-                player.sendMessage(ChatColor.YELLOW + "このパスワードを使用してWebからチャージできます。次の /webcharge 実行でこのパスワードは無効になります。");
+                if (args.length == 1 && args[0].equalsIgnoreCase("revoke")) {
+                    dbManager.updateWebPassword(user.uuid, null, null);
+                    player.sendMessage(ChatColor.GREEN + "Walletのパスワードを無効にしました。");
+                    return true;
+                }
+                issueWebPassword(player, user);
                 return true;
             }
         } catch (Exception e) {
@@ -298,77 +281,132 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         return false;
     }
 
-    private void writeCard(Player player, DatabaseManager.UserData user, String cardDataStr, String historyFrom) {
-        String[] cardData = cardDataStr.split("-");
-        try {
-            if (cardData.length < 5 || (cardData.length != 7 && (Integer.parseInt(cardData[0]) == 2 || Integer.parseInt(cardData[0]) == 3))) {
-                player.sendMessage(ChatColor.RED + "入力内容が正しくありません。コードを再度発行し直してください。");
-                return;
-            }
-            int ticketType = Integer.parseInt(cardData[0]);
-            int companyCode = Integer.parseInt(cardData[1]);
-            int purchaseAmount = Integer.parseInt(cardData[2]);
-            String expiryDateStr = cardData[3];
-            int checkDigit = Integer.parseInt(cardData[4]);
+    // Wallet のパスワードを発行する。DB にはハッシュだけを保存するので、表示できるのはこのときだけ
+    private void issueWebPassword(Player player, DatabaseManager.UserData user) throws SQLException {
+        String token = WebPasswords.generateToken();
+        long now = System.currentTimeMillis() / 1000L;
+        Long expiresAt = webPasswordTtlSeconds > 0 ? now + webPasswordTtlSeconds : null;
+        dbManager.updateWebPassword(user.uuid, WebPasswords.hashToken(token), expiresAt);
+        // 第三者の認証失敗で本人が待たされている場合も、新しいパスワードですぐに使えるようにする
+        apiSecurity.clearAuthFailures(player.getName());
 
-            if (ticketType < 1 || ticketType > 4 || companyCode < 0 || companyCode > 99 || purchaseAmount <= 0) {
-                player.sendMessage(ChatColor.RED + "コードの内容が正しくありません。コードを再度発行し直してください。");
-                return;
-            }
-
-            if (companyCode == 99 && !player.hasPermission("toropassicsystem.admin")) {
-                player.sendMessage(ChatColor.RED + "TORO全線定期を発行する権限がありません。");
-                return;
-            }
-
-            int expectedCheckDigit = computeCheckDigit(ticketType, companyCode, purchaseAmount, expiryDateStr);
-            if (checkDigit != expectedCheckDigit) {
-                player.sendMessage(ChatColor.RED + "チェックデジットが不正です。コードを再度発行し直してください。");
-                return;
-            }
-
-            SimpleDateFormat dateFormat = new SimpleDateFormat("yyyyMMdd");
-            dateFormat.setLenient(false);
-            Date expiryDate = dateFormat.parse(expiryDateStr);
-            Calendar calendar = Calendar.getInstance();
-            calendar.setTime(expiryDate);
-            calendar.set(Calendar.HOUR_OF_DAY, 23);
-            calendar.set(Calendar.MINUTE, 59);
-            calendar.set(Calendar.SECOND, 59);
-            calendar.set(Calendar.MILLISECOND, 999);
-            expiryDate = calendar.getTime();
-
-            if (user.balance < purchaseAmount) {
-                player.sendMessage(ChatColor.RED + "残高が不足しています。現在の残高: " + user.balance + "トロポ, 購入金額: " + purchaseAmount + "トロポ");
-                return;
-            }
-
-            // ユーザーの定期券情報に保存
-            user.ticketType = ticketType;
-            user.companyCode = companyCode;
-            user.purchaseAmount = purchaseAmount;
-            user.expiryDate = expiryDate.getTime();
-            user.checkDigit = checkDigit;
-            if (ticketType == 2 || ticketType == 3) {
-                user.routeStart = cardData[5];
-                user.routeEnd = cardData[6];
-            } else {
-                user.routeStart = null;
-                user.routeEnd = null;
-            }
-            user.balance -= purchaseAmount;
-            PaymentHistory h = PaymentHistory.build(historyFrom, "", purchaseAmount * -1, user.balance, System.currentTimeMillis() / 1000L, "");
-            try {
-                dbManager.addHistory(user.uuid, h);
-                dbManager.upsertUser(user);
-            } catch (SQLException ex) {
-                sendInternalError(player, "DBエラー", ex);
-                return;
-            }
-            player.sendMessage(ChatColor.GREEN + "定期券情報を書き込みました。");
-        } catch (NumberFormatException | ParseException e) {
-            player.sendMessage(ChatColor.RED + "引数の形式が正しくありません。コードを再度発行し直してください。");
+        TextComponent message = new TextComponent("Webチャージ用パスワードを生成しました: " + token);
+        message.setColor(net.md_5.bungee.api.ChatColor.GREEN);
+        message.setClickEvent(new ClickEvent(ClickEvent.Action.COPY_TO_CLIPBOARD, token));
+        player.spigot().sendMessage(message);
+        player.sendMessage(ChatColor.YELLOW + "クリックするとコピーできます。このパスワードを使用してWebからチャージできます。次の /webcharge 実行でこのパスワードは無効になります。");
+        if (expiresAt != null) {
+            String expiry = new SimpleDateFormat("yyyy年MM月dd日").format(new Date(expiresAt * 1000L));
+            player.sendMessage(ChatColor.YELLOW + "有効期限: " + expiry + " / 無効にするには /webcharge revoke");
+        } else {
+            player.sendMessage(ChatColor.YELLOW + "無効にするには /webcharge revoke");
         }
+    }
+
+    // ランキングはメインスレッドの外で集計し、結果の表示だけメインスレッドで行う
+    private void showRanking(Player player) {
+        long now = System.currentTimeMillis();
+        rankCommandUsedAt.values().removeIf(usedAt -> now - usedAt >= rankCooldownMillis);
+        if (rankCommandUsedAt.containsKey(player.getUniqueId())) {
+            player.sendMessage(ChatColor.RED + "しばらく待ってから再度実行してください。");
+            return;
+        }
+        if (rankCooldownMillis > 0) rankCommandUsedAt.put(player.getUniqueId(), now);
+
+        rankingService.snapshot().whenComplete((snapshot, error) -> runOnMainThread(() -> {
+            if (!player.isOnline()) return;
+            if (error != null) {
+                sendInternalError(player, "ランキング取得エラー", error instanceof Exception e ? e : new RuntimeException(error));
+                return;
+            }
+            sendRanking(player, snapshot);
+        }));
+    }
+
+    private void runOnMainThread(Runnable task) {
+        if (Bukkit.isPrimaryThread()) {
+            task.run();
+            return;
+        }
+        try {
+            Bukkit.getScheduler().runTask(this, task);
+        } catch (IllegalPluginAccessException ignored) {
+            // プラグインの停止中は表示しない
+        }
+    }
+
+    private void sendRanking(Player player, RankingService.Snapshot snapshot) {
+        player.sendMessage(ChatColor.GOLD + "=====TOROpass 移動量ランキング=====");
+        boolean playerInTop10 = false;
+        for (RankingService.Entry entry : snapshot.top(10)) {
+            String playerName = Objects.requireNonNullElse(entry.name(), "不明なプレイヤー");
+            String distance = formatDistance(entry.consumption() * 5.0);
+            String message = ChatColor.YELLOW + String.valueOf(snapshot.rankOf(entry.consumption())) + "位 " + playerName + " " + entry.consumption() + "トロポ " + distance;
+            if (entry.uuid().equals(player.getUniqueId())) {
+                message += " (自分)";
+                playerInTop10 = true;
+            }
+            player.sendMessage(message);
+        }
+
+        if (!playerInTop10) {
+            long playerConsumption = snapshot.consumptionOf(player.getUniqueId());
+            String playerDistance = formatDistance(playerConsumption * 5.0);
+            player.sendMessage(ChatColor.YELLOW + String.valueOf(snapshot.rankOf(playerConsumption)) + "位 " + player.getName() + "(あなた) " + playerConsumption + "トロポ " + playerDistance);
+        }
+
+        String totalDistance = formatDistance(snapshot.totalConsumption() * 5.0);
+        player.sendMessage(ChatColor.GOLD + "全ユーザーの移動量: " + snapshot.totalConsumption() + "トロポ " + totalDistance);
+    }
+
+    // 定期券コードを検証して書き込み、購入金額を引き去る。書き込んだ場合は true
+    private boolean writeCard(Player player, String cardDataStr, String historyFrom) {
+        CardCodes.Result parsed = CardCodes.parse(cardDataStr, cardCodeSettings, LocalDate.now());
+        if (!parsed.ok()) {
+            player.sendMessage(ChatColor.RED + cardCodeErrorMessage(parsed.error()) + "コードを再度発行し直してください。");
+            return false;
+        }
+        CardCodes.Card card = parsed.card();
+
+        if (card.companyCode() == 99 && !player.hasPermission("toropassicsystem.admin")) {
+            player.sendMessage(ChatColor.RED + "TORO全線定期を発行する権限がありません。");
+            return false;
+        }
+
+        DatabaseManager.TicketData ticket = new DatabaseManager.TicketData(card.ticketType(), card.companyCode(), card.purchaseAmount(),
+                card.expiryEpochMillis(ZoneId.systemDefault()), card.checkDigit(), card.routeStart(), card.routeEnd());
+        PaymentHistory h = PaymentHistory.build(historyFrom, "", card.purchaseAmount() * -1, 0, System.currentTimeMillis() / 1000L, "");
+        try {
+            OptionalInt balance = dbManager.purchaseTicket(player.getUniqueId(), ticket, h);
+            if (balance.isEmpty()) {
+                DatabaseManager.UserData current = dbManager.getUser(player.getUniqueId());
+                int currentBalance = current != null ? current.balance : 0;
+                player.sendMessage(ChatColor.RED + "残高が不足しています。現在の残高: " + currentBalance + "トロポ, 購入金額: " + card.purchaseAmount() + "トロポ");
+                return false;
+            }
+        } catch (SQLException ex) {
+            sendInternalError(player, "DBエラー", ex);
+            return false;
+        }
+        player.sendMessage(ChatColor.GREEN + "定期券情報を書き込みました。");
+        return true;
+    }
+
+    private static String cardCodeErrorMessage(CardCodes.Error error) {
+        return switch (error) {
+            case MALFORMED -> "入力内容が正しくありません。";
+            case BAD_FIELD -> "引数の形式が正しくありません。";
+            case OUT_OF_RANGE -> "コードの内容が正しくありません。";
+            case CHECK_DIGIT -> "チェックデジットが不正です。";
+            case EXPIRED -> "有効期限が切れたコードです。";
+            case VALIDITY_TOO_LONG -> "有効期限が長すぎます。";
+            case AMOUNT_NOT_ALLOWED -> "購入金額が範囲外です。";
+            case SIGNATURE_REQUIRED, SIGNATURE_INVALID -> "コードの署名を確認できません。";
+        };
+    }
+
+    private static PaymentHistory chargeHistory(int amount) {
+        return PaymentHistory.build("Special::charge", "", amount, 0, System.currentTimeMillis() / 1000L, "チャージ");
     }
 
     @EventHandler
@@ -389,12 +427,11 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 return;
             } else {
                 if (!player.getName().equals(user.playername)) {
+                    dbManager.updatePlayerName(user.uuid, player.getName());
                     user.playername = player.getName();
-                    user.lastupdate = System.currentTimeMillis() / 1000L;
-                    dbManager.upsertUser(user);
                 }
             }
-            
+
             StationData data = playerData.computeIfAbsent(player.getUniqueId(), k -> {
                 StationData newData = new StationData();
                 newData.balance = user.balance;
@@ -429,6 +466,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     handleStationSign(frontLine1, frontLine2, frontLine4, player, item, data, event, user);
                     break;
                 case "[チャージ]":
+                    if (!isSignUsable(sign, player)) return;
                     handleChargeSign(frontLine2, player, data, user);
                     break;
                 case "[残高確認]":
@@ -461,6 +499,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     handleTransferSign(frontLine2, frontLine3, frontLine4, player, item, data, event, user);
                     break;
                 case "[物販]":
+                    if (!isSignUsable(sign, player)) return;
                     if ("[IC]".equals(backLine2) && "ここにタッチ".equals(backLine3))
                         handleShopSign(frontLine2, frontLine3, player, data, user);
                     else player.sendMessage(ChatColor.RED + "この看板は物販用に正しく設定されていません。");
@@ -492,7 +531,6 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         }
 
         int fare = data.stationName.equals(stationName) ? 100 : data.calculateFare();
-        ItemMeta meta = item.getItemMeta();
         TicketValidationResult result = validateTicketFromDB(user, data, stationName, companyCodes);
 
         if (result.isExpired && result.ticketType != null) {
@@ -512,40 +550,11 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 sendInternalError(player, "履歴保存エラー", e);
             }
         } else {
-            // オートチャージチェック（DBの残高で判定）
-            if (user.autoChargeThreshold != null && user.autoChargeAmount != null && user.balance < user.autoChargeThreshold) {
-                user.balance += user.autoChargeAmount;
-                data.balance = user.balance;  // StationDataも同期
-                user.lastupdate = System.currentTimeMillis() / 1000L;
-                try {
-                    dbManager.upsertUser(user);
-                    PaymentHistory autoChargeHistory = PaymentHistory.build("Special::autocharge", "", user.autoChargeAmount, user.balance, System.currentTimeMillis() / 1000L, "オートチャージ");
-                    dbManager.addHistory(user.uuid, autoChargeHistory);
-                } catch (SQLException e) {
-                    sendInternalError(player, "オートチャージエラー", e);
-                    return;
-                }
-                player.sendMessage(ChatColor.GREEN + "オートチャージが実行されました。新しい残高: " + user.balance + "トロポ");
-            }
-            
-            if (user.balance < fare) {
-                player.sendMessage(ChatColor.RED + String.valueOf(fare - user.balance) + "トロポ不足しています。チャージしてください。");
-                return;
-            }
-            
-            user.balance -= fare;
-            data.balance = user.balance;  // StationDataも同期
-            user.lastupdate = System.currentTimeMillis() / 1000L;
-            
-            PaymentHistory h = PaymentHistory.build(data.stationName + data.entryCompanyCodes, stationName + data.validateCompanyCodes(companyCodes), fare * -1, user.balance, System.currentTimeMillis() / 1000L, "出場");
-            try {
-                dbManager.addHistory(user.uuid, h);
-                dbManager.upsertUser(user);
-            } catch (SQLException e) {
-                sendInternalError(player, "DBエラー", e);
-                return;
-            }
-            
+            if (!runAutoCharge(player, data, user)) return;
+
+            PaymentHistory h = PaymentHistory.build(data.stationName + data.entryCompanyCodes, stationName + data.validateCompanyCodes(companyCodes), fare * -1, 0, System.currentTimeMillis() / 1000L, "出場");
+            if (!payFromBalance(player, data, user, fare, h)) return;
+
             player.sendMessage(ChatColor.GREEN + "出場: " + stationName + (data.stationName.equals(stationName) ? "(入場サービス)" : "") + " 引去: " + fare + "トロポ");
             player.sendMessage(ChatColor.GREEN + "残高: " + user.balance + "トロポ");
         }
@@ -555,26 +564,62 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         data.exitStation();
     }
 
+    // オートチャージの設定があり残高が閾値を下回っていればチャージする。DBエラーの場合は false
+    private boolean runAutoCharge(Player player, StationData data, DatabaseManager.UserData user) {
+        if (!autoChargeEnabled) return true;
+        try {
+            OptionalInt balance = dbManager.autoCharge(user.uuid);
+            if (balance.isPresent()) {
+                user.balance = balance.getAsInt();
+                data.balance = user.balance;  // StationDataも同期
+                player.sendMessage(ChatColor.GREEN + "オートチャージが実行されました。新しい残高: " + user.balance + "トロポ");
+            }
+            return true;
+        } catch (SQLException e) {
+            sendInternalError(player, "オートチャージエラー", e);
+            return false;
+        }
+    }
+
+    // 残高から引き去る。残高不足やDBエラーの場合はメッセージを出して false
+    private boolean payFromBalance(Player player, StationData data, DatabaseManager.UserData user, int amount, PaymentHistory history) {
+        try {
+            OptionalInt balance = dbManager.debit(user.uuid, amount, history);
+            if (balance.isEmpty()) {
+                DatabaseManager.UserData current = dbManager.getUser(user.uuid);
+                int currentBalance = current != null ? current.balance : user.balance;
+                player.sendMessage(ChatColor.RED + String.valueOf(amount - currentBalance) + "トロポ不足しています。チャージしてください。");
+                return false;
+            }
+            user.balance = balance.getAsInt();
+            data.balance = user.balance;  // StationDataも同期
+            return true;
+        } catch (SQLException e) {
+            sendInternalError(player, "DBエラー", e);
+            return false;
+        }
+    }
+
     private void handleChargeSign(String amountStr, Player player, StationData data, DatabaseManager.UserData user) {
         try {
             int chargeAmount = Integer.parseInt(amountStr);
-            if (chargeAmount <= 0 || user.balance + chargeAmount > 20000) {
-                player.sendMessage(ChatColor.RED + (chargeAmount <= 0 ? "チャージ額が不正です" : "最大チャージ額は20000トロポまでです"));
+            if (chargeAmount <= 0) {
+                player.sendMessage(ChatColor.RED + "チャージ額が不正です");
                 return;
             }
-            user.balance += chargeAmount;
-            data.balance = user.balance;  // StationDataも同期
-            user.lastupdate = System.currentTimeMillis() / 1000L;
-            
-            PaymentHistory h = PaymentHistory.build("Special::charge", "", chargeAmount, user.balance, System.currentTimeMillis() / 1000L, "チャージ");
             try {
-                dbManager.addHistory(user.uuid, h);
-                dbManager.upsertUser(user);
+                OptionalInt balance = dbManager.credit(user.uuid, chargeAmount, DatabaseManager.MAX_BALANCE, chargeHistory(chargeAmount));
+                if (balance.isEmpty()) {
+                    player.sendMessage(ChatColor.RED + "最大チャージ額は20000トロポまでです");
+                    return;
+                }
+                user.balance = balance.getAsInt();
+                data.balance = user.balance;  // StationDataも同期
             } catch (SQLException e) {
                 sendInternalError(player, "DBエラー", e);
                 return;
             }
-            
+
             player.sendMessage(ChatColor.GREEN + String.valueOf(chargeAmount) + "トロポをチャージしました。");
             player.sendMessage(ChatColor.GREEN + "現在の残高: " + user.balance + "トロポ");
         } catch (NumberFormatException e) {
@@ -589,19 +634,16 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 player.sendMessage(ChatColor.RED + "値が不正です。");
                 return;
             }
-            user.balance = newBalance;
-            data.balance = user.balance;  // StationDataも同期
-            user.lastupdate = System.currentTimeMillis() / 1000L;
-            
-            PaymentHistory h = PaymentHistory.build("Special::balanceAdjustment", "", newBalance, user.balance, System.currentTimeMillis() / 1000L, "残額調整");
+            PaymentHistory h = PaymentHistory.build("Special::balanceAdjustment", "", newBalance, 0, System.currentTimeMillis() / 1000L, "残額調整");
             try {
-                dbManager.addHistory(user.uuid, h);
-                dbManager.upsertUser(user);
+                dbManager.setBalance(user.uuid, newBalance, h);
             } catch (SQLException e) {
                 sendInternalError(player, "DBエラー", e);
                 return;
             }
-            
+            user.balance = newBalance;
+            data.balance = user.balance;  // StationDataも同期
+
             player.sendMessage(ChatColor.GREEN + "新しい残高: " + user.balance + "トロポ");
         } catch (NumberFormatException e) {
             player.sendMessage(ChatColor.RED + "無効な残高値です");
@@ -615,17 +657,8 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         }
 
         // DBの定期券情報を削除
-        user.ticketType = null;
-        user.companyCode = null;
-        user.purchaseAmount = null;
-        user.expiryDate = null;
-        user.checkDigit = null;
-        user.routeStart = null;
-        user.routeEnd = null;
-        user.lastupdate = System.currentTimeMillis() / 1000L;
-
         try {
-            dbManager.upsertUser(user);
+            dbManager.clearTicket(user.uuid);
             player.sendMessage(ChatColor.GREEN + "定期券情報を削除しました。");
         } catch (SQLException e) {
             sendInternalError(player, "DBエラー", e);
@@ -656,7 +689,6 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             return;
         }
         int fare = data.calculateFare();
-        ItemMeta meta = item.getItemMeta();
         TicketValidationResult result = validateTicketFromDB(user, data, departureStation, companyCodes);
 
         if (result.isExpired && result.ticketType != null) {
@@ -675,40 +707,11 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 sendInternalError(player, "履歴保存エラー", e);
             }
         } else {
-            // オートチャージチェック（DBの残高で判定）
-            if (user.autoChargeThreshold != null && user.autoChargeAmount != null && user.balance < user.autoChargeThreshold) {
-                user.balance += user.autoChargeAmount;
-                data.balance = user.balance;  // StationDataも同期
-                user.lastupdate = System.currentTimeMillis() / 1000L;
-                try {
-                    dbManager.upsertUser(user);
-                    PaymentHistory autoChargeHistory = PaymentHistory.build("Special::autocharge", "", user.autoChargeAmount, user.balance, System.currentTimeMillis() / 1000L, "オートチャージ");
-                    dbManager.addHistory(user.uuid, autoChargeHistory);
-                } catch (SQLException e) {
-                    sendInternalError(player, "オートチャージエラー", e);
-                    return;
-                }
-                player.sendMessage(ChatColor.GREEN + "オートチャージが実行されました。新しい残高: " + user.balance + "トロポ");
-            }
-            
-            if (user.balance < fare) {
-                player.sendMessage(ChatColor.RED + String.valueOf(fare - user.balance) + "トロポ不足しています。チャージしてください。");
-                return;
-            }
-            
-            user.balance -= fare;
-            data.balance = user.balance;  // StationDataも同期
-            user.lastupdate = System.currentTimeMillis() / 1000L;
-            
-            PaymentHistory h = PaymentHistory.build(data.stationName + data.entryCompanyCodes, departureStation + data.validateCompanyCodes(companyCodes), fare * -1, user.balance, System.currentTimeMillis() / 1000L, "出場");
-            try {
-                dbManager.addHistory(user.uuid, h);
-                dbManager.upsertUser(user);
-            } catch (SQLException e) {
-                sendInternalError(player, "DBエラー", e);
-                return;
-            }
-            
+            if (!runAutoCharge(player, data, user)) return;
+
+            PaymentHistory h = PaymentHistory.build(data.stationName + data.entryCompanyCodes, departureStation + data.validateCompanyCodes(companyCodes), fare * -1, 0, System.currentTimeMillis() / 1000L, "出場");
+            if (!payFromBalance(player, data, user, fare, h)) return;
+
             player.sendMessage(ChatColor.GREEN + "出場: " + departureStation + " 引去: " + fare + "トロポ");
         }
 
@@ -729,40 +732,11 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 return;
             }
             
-            // オートチャージチェック（DBの残高で判定）
-            if (user.autoChargeThreshold != null && user.autoChargeAmount != null && user.balance < user.autoChargeThreshold) {
-                user.balance += user.autoChargeAmount;
-                data.balance = user.balance;  // StationDataも同期
-                user.lastupdate = System.currentTimeMillis() / 1000L;
-                try {
-                    dbManager.upsertUser(user);
-                    PaymentHistory autoChargeHistory = PaymentHistory.build("Special::autocharge", "", user.autoChargeAmount, user.balance, System.currentTimeMillis() / 1000L, "オートチャージ");
-                    dbManager.addHistory(user.uuid, autoChargeHistory);
-                } catch (SQLException e) {
-                    sendInternalError(player, "オートチャージエラー", e);
-                    return;
-                }
-                player.sendMessage(ChatColor.GREEN + "オートチャージが実行されました。新しい残高: " + user.balance + "トロポ");
-            }
-            
-            if (user.balance < amount) {
-                player.sendMessage(ChatColor.RED + String.valueOf(amount - user.balance) + "トロポ不足しています。チャージしてください。");
-                return;
-            }
-            
-            user.balance -= amount;
-            data.balance = user.balance;  // StationDataも同期
-            user.lastupdate = System.currentTimeMillis() / 1000L;
-            
-            PaymentHistory h = PaymentHistory.build("Shop::" + storeName, "", amount * -1, user.balance, System.currentTimeMillis() / 1000L, "購入");
-            try {
-                dbManager.addHistory(user.uuid, h);
-                dbManager.upsertUser(user);
-            } catch (SQLException e) {
-                sendInternalError(player, "DBエラー", e);
-                return;
-            }
-            
+            if (!runAutoCharge(player, data, user)) return;
+
+            PaymentHistory h = PaymentHistory.build("Shop::" + storeName, "", amount * -1, 0, System.currentTimeMillis() / 1000L, "購入");
+            if (!payFromBalance(player, data, user, amount, h)) return;
+
             player.sendMessage(ChatColor.GREEN + "店舗: " + storeName);
             player.sendMessage(ChatColor.GREEN + "支払額: " + amount + "トロポ");
             player.sendMessage(ChatColor.GREEN + "残高: " + user.balance + "トロポ");
@@ -778,6 +752,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         String frontLine1 = ChatColor.stripColor(frontSide.getLine(0));
         if (!"[TOROpass販売]".equals(frontLine1)) return;
         event.setCancelled(true);
+        if (!isSignUsable(sign, player)) return;
 
         try {
             int customModelData = Integer.parseInt(ChatColor.stripColor(frontSide.getLine(1)));
@@ -813,7 +788,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         }
     }
 
-    @EventHandler
+    @EventHandler(ignoreCancelled = true)
     public void onSignChange(SignChangeEvent event) {
         String line1 = ChatColor.stripColor(event.getLine(0));
         Player player = event.getPlayer();
@@ -822,6 +797,35 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             event.setCancelled(true);
             return;
         }
+        handleSpecialSignSetup(event, line1, player);
+        // 権限のあるプレイヤーが作った特殊看板に印を付ける (看板の内容が確定した次のティックで書き込む)
+        if (isSpecialSignHeader(line1) && !event.isCancelled()) {
+            Block block = event.getBlock();
+            Bukkit.getScheduler().runTask(this, () -> markAuthorizedSign(block));
+        }
+    }
+
+    private void markAuthorizedSign(Block block) {
+        if (!(block.getState() instanceof Sign sign)) return;
+        sign.getPersistentDataContainer().set(signMarkKey, PersistentDataType.STRING, signMarkValue(block));
+        sign.update(true, false);
+    }
+
+    // 印には看板の位置を入れ、構造物の貼り付けなどで別の場所へ複製された看板を区別する
+    private static String signMarkValue(Block block) {
+        return block.getWorld().getUID() + ":" + block.getX() + ":" + block.getY() + ":" + block.getZ();
+    }
+
+    // signs.require-authorized-mark が有効なら、印のない金銭の看板 (チャージ・物販・販売) を使えないようにする
+    private boolean isSignUsable(Sign sign, Player player) {
+        if (!requireSignMark) return true;
+        String mark = sign.getPersistentDataContainer().get(signMarkKey, PersistentDataType.STRING);
+        if (signMarkValue(sign.getBlock()).equals(mark)) return true;
+        player.sendMessage(ChatColor.RED + "この看板は正しく設定されていません。管理者に連絡してください。");
+        return false;
+    }
+
+    private void handleSpecialSignSetup(SignChangeEvent event, String line1, Player player) {
         switch (line1) {
             case "[入場]":
             case "[出場]":
@@ -927,17 +931,7 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
     }
 
     public static int computeCheckDigit(int ticketType, int companyCode, int purchaseAmount, String expiryDate) {
-        String data = String.format("%d%02d%d%s", ticketType, companyCode, purchaseAmount, expiryDate);
-        int sum = 0;
-        for (int i = 0; i < data.length(); i++) {
-            char c = data.charAt(i);
-            if (Character.isDigit(c)) {
-                int digit = c - '0';
-                if (i % 2 == 1) digit *= 2;
-                sum += (digit / 10) + (digit % 10);
-            }
-        }
-        return (10 - (sum % 10)) % 10;
+        return CardCodes.computeCheckDigit(ticketType, companyCode, purchaseAmount, expiryDate);
     }
 
     private static boolean isSpecialSignHeader(String header) {
@@ -951,21 +945,6 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
 
     private static boolean isValidICCard(ItemStack item) {
         return item != null && item.getType() == Material.PAPER && item.getItemMeta().hasCustomModelData();
-    }
-
-    private TicketValidationResult validateTicket(ItemMeta meta, StationData data, String exitStation, String companyCodesLine) {
-        TicketValidationResult result = new TicketValidationResult();
-        
-        // DBから定期券情報を取得（ICカードアイテムではなく）
-        DatabaseManager.UserData user = null;
-        try {
-            // プレイヤーのUUIDを取得する必要があるが、ここでは直接取得できないため
-            // 別の方法で定期券情報を取得する必要がある
-            // このメソッドを呼び出す側でuserオブジェクトを渡すように修正する
-            return result;
-        } catch (Exception e) {
-            return result;
-        }
     }
 
     // 新しいメソッド：DBの定期券情報で判定
@@ -1019,7 +998,8 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                     result.ticketText = "定期利用:1日乗車券";
                 }
             }
-        } else if ((user.ticketType == 2 || user.ticketType == 3) && data.entryCompanyCodes.contains(companyCodeStr) && exitCompanyCodes.contains(companyCodeStr) &&
+        } else if ((user.ticketType == 2 || user.ticketType == 3) && user.routeStart != null && user.routeEnd != null
+                && data.entryCompanyCodes.contains(companyCodeStr) && exitCompanyCodes.contains(companyCodeStr) &&
                 (user.routeStart.equals(data.stationName) && user.routeEnd.equals(exitStation) || user.routeStart.equals(exitStation) && user.routeEnd.equals(data.stationName))) {
             result.isFree = true;
             result.ticketText = "定期利用:通勤･通学定期";
@@ -1082,16 +1062,6 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
                 String.format("%.0f", meters) + "m";
     }
 
-    private String generateRandomPassword(int length) {
-        String chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        SecureRandom random = new SecureRandom();
-        StringBuilder password = new StringBuilder(length);
-        for (int i = 0; i < length; i++) {
-            password.append(chars.charAt(random.nextInt(chars.length())));
-        }
-        return password.toString();
-    }
-
     public static class StationData {
         public boolean isInStation = false;
         public int balance = 0;
@@ -1100,7 +1070,6 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         private double travelDistance = 0;
         public Integer autoChargeThreshold = null;
         public Integer autoChargeAmount = null;
-        public String webChargePassword = null;
         private List<String> entryCompanyCodes = new ArrayList<>();
 
         public void enterStation(String stationName, String companyCodesLine) {
@@ -1146,383 +1115,6 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
         }
     }
 
-    public static class HTTPServer extends NanoHTTPD {
-        private static final Set<String> POST_ROUTES = Set.of("/api/webcharge", "/api/writecard", "/api/getcardinfo", "/api/delcardinfo", "/api/pay");
-
-        private final TOROpassICsystem mainclass;
-        private final ApiSecurity security;
-
-        public HTTPServer(int port, TOROpassICsystem mainclass, ApiSecurity security) throws IOException {
-            super(port);
-            this.mainclass = mainclass;
-            this.security = security;
-            start(SOCKET_READ_TIMEOUT, false);
-        }
-
-        @Override
-        public Response serve(IHTTPSession session) {
-            try {
-                String uri = session.getUri();
-                Method method = session.getMethod();
-                String clientIp = security.clientIp(session.getHeaders(), session.getRemoteIpAddress());
-
-                // 読み取り系API: IPごとのレート制限と、設定で有効な場合はパスワード認証
-                if (uri.startsWith("/api/balance/") || uri.startsWith("/api/history/") || uri.startsWith("/api/fullhistory/")) {
-                    Response denied = guardReadRoute(session, uri, clientIp);
-                    if (denied != null) return denied;
-                }
-
-                // POST API: ボディをサイズ上限付きで読み込み、JSONとして解析する
-                Map<String, Object> request = null;
-                if (method == Method.POST && POST_ROUTES.contains(uri)) {
-                    try {
-                        request = readJsonBody(session);
-                    } catch (RequestBodies.BodyException e) {
-                        Response r = jsonError(e.getStatus() == 413 ? Response.Status.PAYLOAD_TOO_LARGE : Response.Status.BAD_REQUEST, e.getMessage());
-                        // 読み残したボディが次のリクエストとして解釈されないよう接続を閉じる
-                        r.closeConnection(true);
-                        return r;
-                    }
-                    if (request == null) {
-                        return jsonError(Response.Status.BAD_REQUEST, "Invalid JSON");
-                    }
-                }
-
-                if (uri.equals("/")) {
-                    return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\"}");
-                } else if (uri.startsWith("/api/balance/")) {
-                    String playerName = uri.substring("/api/balance/".length());
-                    try {
-                        UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
-                        if (uuid == null) {
-                            return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\":\"ERROR\",\"message\":\"Player Not Found\"}");
-                        }
-                        DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                        if (user == null) {
-                            return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\":\"ERROR\",\"message\":\"Player Not Found\"}");
-                        }
-                        return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"balance\":" + user.balance + "}");
-                    } catch (Exception e) {
-                        logApiError(uri, e);
-                        return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\":\"ERROR\",\"message\":\"DB Error\"}");
-                    }
-                } else if (uri.startsWith("/api/history/") || uri.startsWith("/api/fullhistory/")) {
-                    String playerName = uri.substring(uri.indexOf("/", 5) + 1);
-                    try {
-                        UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
-                        if (uuid == null) {
-                            return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found (Player Not Found)");
-                        }
-                        DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                        if (user == null) {
-                            return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found (Player Not Found)");
-                        }
-                        List<PaymentHistory> history = mainclass.dbManager.getHistory(user.uuid, uri.startsWith("/api/history/") ? 100 : 0);
-                        return newFixedLengthResponse(Response.Status.OK, "application/json", mainclass.mapper.writeValueAsString(history));
-                    } catch (Exception e) {
-                        logApiError(uri, e);
-                        return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "500 Internal Server Error (DB Error)");
-                    }
-                } else if (uri.equals("/api/webcharge") && method == Method.POST) {
-                    try {
-                        String playerName = (String) request.get("playername");
-                        String password = (String) request.get("password");
-                        Object chargeBalanceObj = request.get("chargebalance");
-                        if (playerName == null || password == null || chargeBalanceObj == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Missing required fields\"}");
-                        }
-                        Response locked = checkAuthLock(playerName, clientIp);
-                        if (locked != null) return locked;
-
-                        int chargeBalance;
-                        try {
-                            chargeBalance = Integer.parseInt(chargeBalanceObj.toString());
-                        } catch (NumberFormatException e) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Invalid charge amount\"}");
-                        }
-
-                        UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
-                        if (uuid == null) {
-                            return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player not found\"}");
-                        }
-
-                        DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                        Response denied = verifyPassword(user, playerName, password, clientIp);
-                        if (denied != null) return denied;
-
-                        if (chargeBalance <= 0 || user.balance + chargeBalance > 20000) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": " +
-                                    (chargeBalance <= 0 ? "\"Invalid charge amount\"" : "\"Maximum balance is 20000 Tropo\"") + "}");
-                        }
-
-                        user.balance += chargeBalance;
-                        mainclass.dbManager.upsertUser(user);
-
-                        return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"balance\": " + user.balance + "}");
-                    } catch (Exception e) {
-                        logApiError(uri, e);
-                        return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\": \"ERROR\", \"message\": \"Internal server error\"}");
-                    }
-                } else if (uri.equals("/api/writecard") && method == Method.POST) {
-                    try {
-                        String playerName = (String) request.get("playername");
-                        String password = (String) request.get("password");
-                        String cardData = (String) request.get("carddata");
-                        if (playerName == null || password == null || cardData == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Missing required fields\"}");
-                        }
-                        Response locked = checkAuthLock(playerName, clientIp);
-                        if (locked != null) return locked;
-
-                        UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
-                        if (uuid == null) {
-                            return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player not found\"}");
-                        }
-
-                        // プレイヤー・インベントリの操作はメインスレッドで行う
-                        return callSync(uri, () -> {
-                            Player onlinePlayer = Bukkit.getPlayer(uuid);
-                            if (onlinePlayer == null) {
-                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player must be online to write card\"}");
-                            }
-
-                            DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                            Response denied = verifyPassword(user, playerName, password, clientIp);
-                            if (denied != null) return denied;
-
-                            ItemStack item = findValidICCard(onlinePlayer);
-                            if (item == null) {
-                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"No valid IC card found in player's inventory\"}");
-                            }
-
-                            mainclass.writeCard(onlinePlayer, user, cardData, "Special::webwritecard");
-                            return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"balance\": " + user.balance + "}");
-                        });
-                    } catch (Exception e) {
-                        logApiError(uri, e);
-                        return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\": \"ERROR\", \"message\": \"Internal server error\"}");
-                    }
-                } else if (uri.equals("/api/getcardinfo") && method == Method.POST) {
-                    try {
-                        String playerName = (String) request.get("playername");
-                        String password = (String) request.get("password");
-                        if (playerName == null || password == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Missing required fields\"}");
-                        }
-                        Response locked = checkAuthLock(playerName, clientIp);
-                        if (locked != null) return locked;
-
-                        UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
-                        if (uuid == null) {
-                            return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player not found\"}");
-                        }
-
-                        // プレイヤー・インベントリの参照はメインスレッドで行う
-                        return callSync(uri, () -> {
-                            Player onlinePlayer = Bukkit.getPlayer(uuid);
-                            if (onlinePlayer == null) {
-                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player must be online\"}");
-                            }
-
-                            DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                            Response denied = verifyPassword(user, playerName, password, clientIp);
-                            if (denied != null) return denied;
-
-                            ItemStack item = findValidICCard(onlinePlayer);
-                            if (item == null) {
-                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"No valid IC card found in player's inventory\"}");
-                            }
-
-                            Map<String, Object> cardInfo = mainclass.getCardInfoFromDB(user);
-                            if (cardInfo.isEmpty()) {
-                                return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"message\": \"No ticket information registered\"}");
-                            }
-
-                            return newFixedLengthResponse(Response.Status.OK, "application/json", mainclass.mapper.writeValueAsString(Map.of("status", "OK", "cardInfo", cardInfo)));
-                        });
-                    } catch (Exception e) {
-                        logApiError(uri, e);
-                        return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\": \"ERROR\", \"message\": \"Internal server error\"}");
-                    }
-                } else if (uri.equals("/api/delcardinfo") && method == Method.POST) {
-                    try {
-                        String playerName = (String) request.get("playername");
-                        String password = (String) request.get("password");
-                        if (playerName == null || password == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Missing required fields\"}");
-                        }
-                        Response locked = checkAuthLock(playerName, clientIp);
-                        if (locked != null) return locked;
-
-                        UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
-                        if (uuid == null) {
-                            return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player not found\"}");
-                        }
-
-                        // プレイヤー・インベントリの操作はメインスレッドで行う
-                        return callSync(uri, () -> {
-                            Player onlinePlayer = Bukkit.getPlayer(uuid);
-                            if (onlinePlayer == null) {
-                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player must be online\"}");
-                            }
-
-                            DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                            Response denied = verifyPassword(user, playerName, password, clientIp);
-                            if (denied != null) return denied;
-
-                            ItemStack item = findValidICCard(onlinePlayer);
-                            if (item == null) {
-                                return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"No valid IC card found in player's inventory\"}");
-                            }
-
-                            boolean deleted = mainclass.deleteCardInfoFromDB(user, onlinePlayer);
-                            if (!deleted) {
-                                return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"message\": \"No ticket information to delete\"}");
-                            }
-
-                            return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"message\": \"Ticket information deleted\"}");
-                        });
-                    } catch (Exception e) {
-                        logApiError(uri, e);
-                        return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\": \"ERROR\", \"message\": \"Internal server error\"}");
-                    }
-                } else if (uri.equals("/api/pay") && method == Method.POST) {
-                    try {
-                        String playerName = (String) request.get("playername");
-                        String password = (String) request.get("password");
-                        Object amountObj = request.get("amount");
-                        String description = (String) request.getOrDefault("description", "");
-                        if (playerName == null || password == null || amountObj == null) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Missing required fields\"}");
-                        }
-                        Response locked = checkAuthLock(playerName, clientIp);
-                        if (locked != null) return locked;
-                        int amount;
-                        try {
-                            amount = Integer.parseInt(amountObj.toString());
-                        } catch (NumberFormatException e) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Invalid amount\"}");
-                        }
-                        UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
-                        if (uuid == null) {
-                            return newFixedLengthResponse(Response.Status.NOT_FOUND, "application/json", "{\"status\": \"ERROR\", \"message\": \"Player not found\"}");
-                        }
-                        DatabaseManager.UserData user = mainclass.dbManager.getUser(uuid);
-                        Response denied = verifyPassword(user, playerName, password, clientIp);
-                        if (denied != null) return denied;
-                        if (amount <= 0 || user.balance < amount) {
-                            return newFixedLengthResponse(Response.Status.BAD_REQUEST, "application/json", "{\"status\": \"ERROR\", \"message\": \"Insufficient balance or invalid amount\"}");
-                        }
-                        user.balance -= amount;
-                        mainclass.dbManager.upsertUser(user);
-                        PaymentHistory h = PaymentHistory.build("web::pay", "", -amount, user.balance, System.currentTimeMillis() / 1000L, description);
-                        mainclass.dbManager.addHistory(user.uuid, h);
-                        return newFixedLengthResponse(Response.Status.OK, "application/json", "{\"status\": \"OK\", \"balance\": " + user.balance + "}");
-                    } catch (Exception e) {
-                        logApiError(uri, e);
-                        return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "application/json", "{\"status\": \"ERROR\", \"message\": \"Internal server error\"}");
-                    }
-                }
-
-                return newFixedLengthResponse(Response.Status.NOT_FOUND, "text/plain", "404 Not Found (URI Error)");
-            } catch (Exception e) {
-                mainclass.getLogger().warning("HTTPサーバー例外: " + e.getClass().getSimpleName() + ": " + e.getMessage());
-                return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, "text/plain", "Internal server error");
-            }
-        }
-
-        // ボディをサイズ上限付きで読み込み、JSONオブジェクトとして解析する (JSONオブジェクトでなければ null)
-        @SuppressWarnings("unchecked")
-        private Map<String, Object> readJsonBody(IHTTPSession session) throws IOException {
-            String body = RequestBodies.read(session.getInputStream(), session.getHeaders().get("content-length"), security.getMaxBodyBytes());
-            try {
-                Object parsed = mainclass.mapper.readValue(body, Object.class);
-                return parsed instanceof Map ? (Map<String, Object>) parsed : null;
-            } catch (JsonProcessingException e) {
-                return null;
-            }
-        }
-
-        // 読み取り系APIの保護。拒否する場合はレスポンスを、許可する場合は null を返す
-        private Response guardReadRoute(IHTTPSession session, String uri, String clientIp) throws SQLException {
-            long wait = security.tryAcquireRead(clientIp);
-            if (wait > 0) return tooManyRequests("Too many requests", wait);
-            if (!security.isRequireAuthForRead()) return null;
-
-            String playerName = uri.startsWith("/api/balance/") ? uri.substring("/api/balance/".length()) : uri.substring(uri.indexOf("/", 5) + 1);
-            // パスワードは X-TOROpass-Password ヘッダー、または password クエリパラメータで受け取る
-            String password = session.getHeaders().get("x-toropass-password");
-            if (password == null) {
-                List<String> values = session.getParameters().get("password");
-                if (values != null && !values.isEmpty()) password = values.get(0);
-            }
-            Response locked = checkAuthLock(playerName, clientIp);
-            if (locked != null) return locked;
-            if (password == null) return jsonError(Response.Status.UNAUTHORIZED, "Password required");
-
-            UUID uuid = mainclass.dbManager.getUUIDByPlayerName(playerName);
-            if (uuid == null) return null; // 存在しないプレイヤーは各APIの処理で 404 を返す
-            return verifyPassword(mainclass.dbManager.getUser(uuid), playerName, password, clientIp);
-        }
-
-        // 認証失敗が続いてロック中のプレイヤー名・IPからのリクエストを拒否する
-        private Response checkAuthLock(String playerName, String clientIp) {
-            long remaining = security.lockRemainingMillis(playerName, clientIp);
-            if (remaining <= 0) return null;
-            return tooManyRequests("Too many failed attempts. Try again later.", remaining);
-        }
-
-        // パスワードを確認する。正しければ null、間違っていれば 401 レスポンスを返す
-        private Response verifyPassword(DatabaseManager.UserData user, String playerName, String password, String clientIp) {
-            if (user == null || !ApiSecurity.passwordMatches(user.webChargePassword, password)) {
-                if (security.recordFailure(playerName, clientIp, password)) {
-                    mainclass.getLogger().warning("Web API: 認証失敗が続いたため一時的にロックしました (player=" + sanitizeForLog(playerName) + ", ip=" + sanitizeForLog(clientIp) + ")");
-                }
-                return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "application/json", "{\"status\": \"ERROR\", \"message\": \"Invalid password\"}");
-            }
-            security.recordSuccess(playerName);
-            return null;
-        }
-
-        // Bukkit API を使う処理をメインスレッドで実行し、結果を待つ
-        private Response callSync(String uri, Callable<Response> task) throws Exception {
-            Future<Response> future = Bukkit.getScheduler().callSyncMethod(mainclass, task);
-            try {
-                return future.get(security.getSyncTimeoutMillis(), TimeUnit.MILLISECONDS);
-            } catch (TimeoutException e) {
-                if (!future.cancel(false)) {
-                    // 既に実行が始まっている場合は、処理済みなのに失敗を返さないよう完了を待つ
-                    return future.get(security.getSyncTimeoutMillis(), TimeUnit.MILLISECONDS);
-                }
-                mainclass.getLogger().warning("Web API: メインスレッドでの処理がタイムアウトしました (" + sanitizeForLog(uri) + ")");
-                return jsonError(Response.Status.SERVICE_UNAVAILABLE, "Server busy. Try again later.");
-            } catch (ExecutionException e) {
-                throw e.getCause() instanceof Exception cause ? cause : e;
-            }
-        }
-
-        private void logApiError(String uri, Exception e) {
-            mainclass.getLogger().log(Level.WARNING, "Web API エラー (" + sanitizeForLog(uri) + ")", e);
-        }
-
-        private static Response tooManyRequests(String message, long retryAfterMillis) {
-            Response r = jsonError(Response.Status.TOO_MANY_REQUESTS, message);
-            r.addHeader("Retry-After", String.valueOf(Math.max(1, (retryAfterMillis + 999) / 1000)));
-            return r;
-        }
-
-        // message には固定の文字列のみを渡すこと
-        private static Response jsonError(Response.IStatus status, String message) {
-            return newFixedLengthResponse(status, "application/json", "{\"status\": \"ERROR\", \"message\": \"" + message + "\"}");
-        }
-
-        private static String sanitizeForLog(String value) {
-            if (value == null) return "null";
-            String s = value.replaceAll("\\p{Cntrl}", "?");
-            return s.length() > 64 ? s.substring(0, 64) + "..." : s;
-        }
-    }
-
     private static ItemStack findValidICCard(Player player) {
         for (ItemStack item : player.getInventory().getContents()) {
             if (isValidICCard(item)) {
@@ -1530,99 +1122,5 @@ public class TOROpassICsystem extends JavaPlugin implements Listener, CommandExe
             }
         }
         return null;
-    }
-
-    private Map<String, Object> getCardInfo(ItemStack item) {
-        Map<String, Object> cardInfo = new HashMap<>();
-        ItemMeta meta = item.getItemMeta();
-        if (!meta.getPersistentDataContainer().has(ticketTypeKey, PersistentDataType.INTEGER)) {
-            return cardInfo;
-        }
-
-        Integer ticketType = meta.getPersistentDataContainer().get(ticketTypeKey, PersistentDataType.INTEGER);
-        Integer companyCode = meta.getPersistentDataContainer().get(companyCodeKey, PersistentDataType.INTEGER);
-        Integer purchaseAmount = meta.getPersistentDataContainer().get(purchaseAmountKey, PersistentDataType.INTEGER);
-        Long expiryDateLong = meta.getPersistentDataContainer().get(expiryDateKey, PersistentDataType.LONG);
-        Integer checkDigit = meta.getPersistentDataContainer().get(checkDigitKey, PersistentDataType.INTEGER);
-        String routeStart = meta.getPersistentDataContainer().get(routeStartKey, PersistentDataType.STRING);
-        String routeEnd = meta.getPersistentDataContainer().get(routeEndKey, PersistentDataType.STRING);
-
-        if (ticketType != null) cardInfo.put("ticketType", ticketType);
-        if (companyCode != null) cardInfo.put("companyCode", String.format("%02d", companyCode));
-        if (purchaseAmount != null) cardInfo.put("purchaseAmount", purchaseAmount);
-        if (expiryDateLong != null) {
-            cardInfo.put("expiryDate", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date(expiryDateLong)));
-        }
-        if (checkDigit != null) cardInfo.put("checkDigit", checkDigit);
-        if (routeStart != null) cardInfo.put("routeStart", routeStart);
-        if (routeEnd != null) cardInfo.put("routeEnd", routeEnd);
-
-        return cardInfo;
-    }
-
-    private boolean deleteCardInfo(ItemStack item, Player player) {
-        ItemMeta meta = item.getItemMeta();
-        if (!meta.getPersistentDataContainer().has(ticketTypeKey, PersistentDataType.INTEGER)) {
-            return false; // 定期券情報なし
-        }
-
-        meta.getPersistentDataContainer().remove(ticketTypeKey);
-        meta.getPersistentDataContainer().remove(companyCodeKey);
-        meta.getPersistentDataContainer().remove(purchaseAmountKey);
-        meta.getPersistentDataContainer().remove(expiryDateKey);
-        meta.getPersistentDataContainer().remove(checkDigitKey);
-        meta.getPersistentDataContainer().remove(routeStartKey);
-        meta.getPersistentDataContainer().remove(routeEndKey);
-        item.setItemMeta(meta);
-
-        player.sendMessage(ChatColor.GREEN + "Webから定期券情報を削除しました。");
-        return true;
-    }
-
-    // 新しいメソッド：DBの定期券情報を取得
-    private Map<String, Object> getCardInfoFromDB(DatabaseManager.UserData user) {
-        Map<String, Object> cardInfo = new HashMap<>();
-        
-        if (user.ticketType == null) {
-            return cardInfo; // 定期券情報なし
-        }
-
-        cardInfo.put("ticketType", user.ticketType);
-        if (user.companyCode != null) cardInfo.put("companyCode", String.format("%02d", user.companyCode));
-        if (user.purchaseAmount != null) cardInfo.put("purchaseAmount", user.purchaseAmount);
-        if (user.expiryDate != null) {
-            cardInfo.put("expiryDate", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date(user.expiryDate)));
-        }
-        if (user.checkDigit != null) cardInfo.put("checkDigit", user.checkDigit);
-        if (user.routeStart != null) cardInfo.put("routeStart", user.routeStart);
-        if (user.routeEnd != null) cardInfo.put("routeEnd", user.routeEnd);
-
-        return cardInfo;
-    }
-
-    // 新しいメソッド：DBの定期券情報を削除
-    private boolean deleteCardInfoFromDB(DatabaseManager.UserData user, Player player) {
-        if (user.ticketType == null) {
-            return false; // 定期券情報なし
-        }
-
-        // DBの定期券情報を削除
-        user.ticketType = null;
-        user.companyCode = null;
-        user.purchaseAmount = null;
-        user.expiryDate = null;
-        user.checkDigit = null;
-        user.routeStart = null;
-        user.routeEnd = null;
-        user.lastupdate = System.currentTimeMillis() / 1000L;
-
-        try {
-            dbManager.upsertUser(user);
-            player.sendMessage(ChatColor.GREEN + "Webから定期券情報を削除しました。");
-            return true;
-        } catch (SQLException e) {
-            sendInternalError(player, "DBエラー", e);
-            return false;
-        }
     }
 }
