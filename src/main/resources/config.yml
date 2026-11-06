@@ -15,7 +15,8 @@ charge:
   auto-charge-enabled: true
 
 # 定期券コード (/writecard, /api/writecard) の検証
-# 既定の設定は、発売機が現在発行しているコードをそのまま受け付けます
+# 署名は既定では任意ですが、有効期限と購入金額には既定で上限が効きます
+# (既存の config.yml に 0 が明記されている場合はそちらが優先されます)
 card-codes:
   # true にすると signing-secret で署名されたコードだけを受け付けます (発売機側の対応が必要です)
   # コードの末尾に -sig.<署名> を付けます。署名は CardCodes.computeSignature を参照してください
@@ -23,10 +24,10 @@ card-codes:
   # HMAC-SHA256 の秘密鍵。空でなければ、署名付きのコードは require-signature が false でも検証します
   signing-secret: ""
   # 今日から何日先までの有効期限を受け付けるか (0 で無制限)
-  max-validity-days: 0
+  max-validity-days: 366
   # 購入金額の下限と上限 (0 で制限なし)
   min-purchase-amount: 0
-  max-purchase-amount: 0
+  max-purchase-amount: 300000
 
 # 特殊看板の確認
 signs:

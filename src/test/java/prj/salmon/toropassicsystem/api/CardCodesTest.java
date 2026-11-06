@@ -122,6 +122,22 @@ class CardCodesTest {
         assertEquals(CardCodes.Error.AMOUNT_NOT_ALLOWED, CardCodes.parse(code(1, 0, 5001, "20261205"), settings, TODAY).error());
     }
 
+    @Test
+    void defaultSettingsLimitValidityAndAmount() {
+        // 設定が読み込めない場合に使われる既定値 (new Settings()) でも、
+        // 署名なしのコードに有効期限と購入金額の上限が効くこと
+        CardCodes.Settings defaults = new CardCodes.Settings();
+        assertFalse(defaults.requireSignature);
+        assertEquals(366, defaults.maxValidityDays);
+        assertEquals(300000, defaults.maxPurchaseAmount);
+
+        // 上限ちょうど (366 日先、上限額) は受け付け、超えると拒否する
+        assertTrue(CardCodes.parse(code(1, 0, 1000, "20271106"), defaults, TODAY).ok());
+        assertEquals(CardCodes.Error.VALIDITY_TOO_LONG, CardCodes.parse(code(1, 0, 1000, "20271107"), defaults, TODAY).error());
+        assertTrue(CardCodes.parse(code(1, 0, 300000, "20261231"), defaults, TODAY).ok());
+        assertEquals(CardCodes.Error.AMOUNT_NOT_ALLOWED, CardCodes.parse(code(1, 0, 300001, "20261231"), defaults, TODAY).error());
+    }
+
     private static String signed(String code, int type, int company, int amount, String expiry, String routeStart, String routeEnd) {
         return code + "-sig." + CardCodes.computeSignature(SECRET, type, company, amount, expiry, routeStart, routeEnd);
     }

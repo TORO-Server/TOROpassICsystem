@@ -48,14 +48,17 @@ public final class CardCodes {
     }
 
     // config.yml の card-codes セクションの値
+    // 既定値は、設定が読み込めない場合に loadCardCodeSettings の初期値として使われる。
+    // その場合でも無制限に倒れないよう、有効期限と購入金額の上限は有限の値にしてある
+    // (0 を明示すれば従来どおり無制限・制限なしにもできる)
     public static class Settings {
         public boolean requireSignature = false;
         public String signingSecret = "";
         // 今日から何日先までの有効期限を受け付けるか (0 で無制限)
-        public int maxValidityDays = 0;
+        public int maxValidityDays = 366;
         // 購入金額の下限と上限 (0 で制限なし)
         public int minPurchaseAmount = 0;
-        public int maxPurchaseAmount = 0;
+        public int maxPurchaseAmount = 300000;
     }
 
     public record Card(int ticketType, int companyCode, int purchaseAmount, LocalDate expiry, int checkDigit, String routeStart, String routeEnd) {
