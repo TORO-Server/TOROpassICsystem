@@ -203,7 +203,7 @@ public class ApiSecurity {
         public boolean requireAuthForRead = true;
         public boolean webChargeEnabled = true;
         public String clientIpHeader = "CF-Connecting-IP";
-        // このヘッダーを信頼する接続元 (cloudflared や toro-edge のある内部ネットワーク)
+        // このヘッダーを信頼する接続元 (cloudflared や入り口のプロキシのある内部ネットワーク)
         public List<String> trustedProxies = List.of("127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7");
         // API が直接 CORS を許可するオリジン (Wallet が CORS 対応のプロキシを経由する間は空のままにする)
         public List<String> corsAllowedOrigins = List.of();
